@@ -1340,6 +1340,26 @@ def process_document(input_file, modify_in_place=False, stages=None):
                                 word.Selection.Collapse(Direction=0)
                                 continue
                             
+                            # ====== 安全防护：跳过实际属于复合引用的匹配 ======
+                            # 检查 [X] 是否实际嵌入在 [4-5] 或 [1,2,3] 这类复合引用中
+                            # 向前看：如果前面紧接着 数字+连接符（如 "4-"），说明是复合尾部
+                            # 向后看：如果后面紧接着 连接符+数字（如 "-6"），说明是复合头部
+                            is_compound_part = False
+                            try:
+                                before_ctx = doc.Range(max(0, rng.Start - 5), rng.Start).Text
+                                after_ctx = doc.Range(rng.End, min(doc.Content.End, rng.End + 5)).Text
+                                # 前面以 数字+连接符+[ 或 数字+连接符 结尾？(如 "4-[" 或在 [4-5] 中 "[4-" 部分)
+                                if re.search(r'[\[【]?\d+\s*[\-~～,，\u2013\u2014]\s*$', before_ctx):
+                                    is_compound_part = True
+                                # 后面以 连接符+数字 开头？(如 "-6]")
+                                if re.search(r'^\s*[\-~～,，\u2013\u2014]\s*\d+', after_ctx):
+                                    is_compound_part = True
+                            except Exception:
+                                pass
+                            if is_compound_part:
+                                word.Selection.Collapse(Direction=0)
+                                continue
+                            
                             # 根据括号后第一个字符预判是否该上标
                             is_super = _check_superscript(rng.Start, rng.End)
                             
