@@ -13,6 +13,7 @@ import os
 import re
 import traceback
 import hashlib
+import sys
 
 # ==============================================================================
 # 第一部分：全局常量与工具函数
@@ -1746,14 +1747,62 @@ def process_document(input_file, modify_in_place=False, stages=None):
             pass
 
 
+class RedirectLogger:
+    """这是一个拦截器窗口，专门用来接收 print() 的输出"""
+    def __init__(self):
+        import tkinter as tk
+        self.win = tk.Tk()
+        self.win.title("🤖 运行日志 - 正在处理中...")
+        self.win.geometry("700x500")
+        self.win.configure(bg="#1e1e2e")
+        self.win.attributes("-topmost", True) # 保持窗口在最前
+        
+        # 创建一个深色主题的文本框
+        self.text = tk.Text(self.win, bg="#1e1e2e", fg="#a6e3a1", font=("Microsoft YaHei", 10), bd=0)
+        self.text.pack(fill="both", expand=True, padx=15, pady=15)
+        
+        # 魔法开始：把系统标准的输出通道替换成自己
+        self.old_stdout = sys.stdout
+        self.old_stderr = sys.stderr
+        sys.stdout = self
+        sys.stderr = self
+
+    def write(self, msg):
+        # 每次程序调用 print()，都会触发这里，把文字插进文本框
+        self.text.insert("end", msg)
+        self.text.see("end") # 自动滚动到最底部
+        self.win.update()    # 强制立刻刷新界面
+
+    def flush(self):
+        pass
+
+    def restore_and_wait(self):
+        import tkinter as tk
+        # 处理完后，把输出通道还给系统
+        sys.stdout = self.old_stdout
+        sys.stderr = self.old_stderr
+        # 弹出一个关闭按钮，防止处理完瞬间闪退，让用户能看清结果
+        btn = tk.Button(self.win, text="处理完成，点击关闭并返回主界面", 
+                        command=self.win.destroy, 
+                        bg="#7c6af7", fg="white", font=("Microsoft YaHei", 10, "bold"),
+                        relief='flat', padx=20, pady=8, cursor='hand2')
+        btn.pack(pady=10)
+        self.win.mainloop()
+
 if __name__ == "__main__":
-    print("📄 Word 文献自动化精灵 已启动，请在弹出的窗口中操作...")
     while True:
+        # 1. 弹出原来的主控制面板
         file_path, modify_in_place, stages, action = show_main_dialog()
         if action == 'quit' or not file_path:
-            print("👋 已退出程序。")
             break
+        
+        # 2. 用户点击开始后，弹出一个专门的日志窗口拦截 print()
+        logger = RedirectLogger()
+        
+        # 3. 开始执行核心逻辑（此时所有的 print 都会跑到 logger 窗口里）
         process_document(file_path, modify_in_place, stages)
         print("\n" + "─" * 50)
-        print("✅ 本次处理完成！窗口将重新弹出，可继续操作或退出。")
-        print("─" * 50 + "\n")
+        print("✅ 本次处理完成！请检查上方日志。")
+        
+        # 4. 暂停在这里等待用户点击“关闭按钮”
+        logger.restore_and_wait()
