@@ -25,6 +25,7 @@ class RefFormatterTool(Tool):
         "格式化Word文档中的参考文献列表。包括：统一字体字号（宋体+Times New Roman，五号）、"
         "英文标题转Sentence Case、期刊名/会议名自动斜体。"
         "需要提供Word文档的完整文件路径。"
+        "【执行顺序】此工具应在 create_reference_crossrefs 之前执行。"
     )
     parameters = {
         "type": "object",
@@ -35,13 +36,13 @@ class RefFormatterTool(Tool):
             },
             "modify_in_place": {
                 "type": "boolean",
-                "description": "是否直接覆盖原文件。默认为false（另存副本）。",
+                "description": "是否直接覆盖原文件。默认为true。与其他工具配合使用时必须为true。",
             },
         },
         "required": ["file_path"],
     }
 
-    def execute(self, file_path: str, modify_in_place: bool = False) -> str:
+    def execute(self, file_path: str, modify_in_place: bool = True) -> str:
         agent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         sys.path.insert(0, agent_dir)
 

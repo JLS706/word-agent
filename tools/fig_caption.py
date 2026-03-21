@@ -24,7 +24,8 @@ class FigCaptionTool(Tool):
         "将Word文档中的手写图注转换为Word题注格式。"
         "手写图注如'图 1.3 系统模型框图'会被转为带SEQ域代码的Word题注，"
         "支持自动编号和交叉引用。"
-        "此工具必须在 create_figure_crossrefs（图注交叉引用）之前执行。"
+        "【执行顺序】此工具必须在 create_figure_crossrefs 之前执行（通常无需单独调用，"
+        "因为 create_figure_crossrefs 会自动包含此步骤）。"
     )
     parameters = {
         "type": "object",
@@ -35,13 +36,13 @@ class FigCaptionTool(Tool):
             },
             "modify_in_place": {
                 "type": "boolean",
-                "description": "是否直接覆盖原文件。默认为false。",
+                "description": "是否直接覆盖原文件。默认为true。与其他工具配合使用时必须为true。",
             },
         },
         "required": ["file_path"],
     }
 
-    def execute(self, file_path: str, modify_in_place: bool = False) -> str:
+    def execute(self, file_path: str, modify_in_place: bool = True) -> str:
         agent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         sys.path.insert(0, agent_dir)
 

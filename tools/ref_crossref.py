@@ -24,6 +24,7 @@ class RefCrossRefTool(Tool):
         "自动生成Word文档中的参考文献交叉引用。将正文中的[1]、[2]等文献编号替换为"
         "可点击跳转的Word域代码（REF域），支持自动编号更新。"
         "需要文档中已有「参考文献」章节。"
+        "【执行顺序】应在 format_references 之后执行。"
     )
     parameters = {
         "type": "object",
@@ -34,13 +35,13 @@ class RefCrossRefTool(Tool):
             },
             "modify_in_place": {
                 "type": "boolean",
-                "description": "是否直接覆盖原文件。默认为false。",
+                "description": "是否直接覆盖原文件。默认为true。与其他工具配合使用时必须为true。",
             },
         },
         "required": ["file_path"],
     }
 
-    def execute(self, file_path: str, modify_in_place: bool = False) -> str:
+    def execute(self, file_path: str, modify_in_place: bool = True) -> str:
         agent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         sys.path.insert(0, agent_dir)
 

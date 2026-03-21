@@ -172,7 +172,8 @@ class AnalyzeDocumentTool(Tool):
                 report.append(f"\n=== 推荐执行计划 ===")
                 for step in plan:
                     report.append(f"  {step}")
-                report.append(f"\n注意: 请严格按以上顺序执行，尤其是图注转换必须在图注交叉引用之前。")
+                report.append(f"\n⚠️ 重要: 请严格按以上顺序执行，且每个工具调用时 modify_in_place 必须为 true，")
+                report.append(f"   否则每个工具各自另存副本，后续工具读取的仍是原始文件，修改不会累积。")
 
             if opened_by_us:
                 doc.Close(SaveChanges=0)
