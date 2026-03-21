@@ -25,6 +25,7 @@ class FigCrossRefTool(Tool):
         "自动生成Word文档中的图注交叉引用。将正文中的'图X.Y'引用替换为"
         "可点击跳转的Word域代码。此工具会自动将手写图注转为Word题注"
         "（包含草稿编号如图1.A的自动重编号），无需手动调用 convert_handwritten_captions。"
+        "【执行顺序】应在 format_references 和 create_reference_crossrefs 之后执行。"
     )
     parameters = {
         "type": "object",
@@ -35,13 +36,13 @@ class FigCrossRefTool(Tool):
             },
             "modify_in_place": {
                 "type": "boolean",
-                "description": "是否直接覆盖原文件。默认为false。",
+                "description": "是否直接覆盖原文件。默认为true。与其他工具配合使用时必须为true。",
             },
         },
         "required": ["file_path"],
     }
 
-    def execute(self, file_path: str, modify_in_place: bool = False) -> str:
+    def execute(self, file_path: str, modify_in_place: bool = True) -> str:
         agent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         sys.path.insert(0, agent_dir)
 

@@ -1125,6 +1125,62 @@ def process_document(input_file, modify_in_place=False, stages=None):
                 except Exception:
                     pass
 
+                # ── 第2.5步：清理手动交叉引用中指向已失效书签的域 ──
+                # 用户有时用 Word 自带的"交叉引用"对话框手工创建引用（书签名为 _Ref...）,
+                # 阶段A 的 rng.Text = new_text 会销毁参考文献段落上的 _Ref 书签，
+                # 导致这些域在 Fields.Update() 后显示"错误!未找到引用源"。
+                # 这里将它们 Unlink 为纯文本，以便后续重新用 ARef_{hash} 替换。
+                legacy_unlinked = 0
+                try:
+                    for fi in range(doc.Fields.Count, 0, -1):
+                        try:
+                            fld = doc.Fields(fi)
+                            # 只处理正文区域（参考文献边界之前）的域
+                            if fld.Code.Start >= initial_boundary_pos:
+                                continue
+                            code_text = fld.Code.Text.strip()
+                            # 已被上面处理过的 ARef_/Auto_Ref_ 域跳过
+                            if 'ARef_' in code_text or 'Auto_Ref_' in code_text:
+                                continue
+                            # 检查是否是 REF 域且引用了 _Ref 书签
+                            ref_m = re.search(r'REF\s+(_Ref\w+)', code_text, re.IGNORECASE)
+                            if not ref_m:
+                                continue
+                            ref_bkmk = ref_m.group(1)
+                            # 如果书签还存在，保留不动
+                            if doc.Bookmarks.Exists(ref_bkmk):
+                                continue
+                            # 书签已失效 → 一律 Unlink 为纯文本
+                            # ⚠️ 禁止访问 fld.Result.Text！访问它会触发 Word 重新求值，
+                            #    书签已死 → 结果变为"错误!未找到引用源"，Unlink 后就是这段错误文字。
+                            #    不访问 .Result.Text，Unlink 会保留原先缓存的显示文字（如 [28]）。
+                            try:
+                                fld.Unlink()
+                                legacy_unlinked += 1
+                            except Exception:
+                                pass
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+
+                # 清除 Unlink 后可能残留的 Word 错误提示文本
+                # （极少数情况下，Word 可能在 Unlink 前就已刷新了域结果）
+                if legacy_unlinked:
+                    print(f"   🔄 已还原 {legacy_unlinked} 个指向已失效书签的旧式手动交叉引用")
+                    try:
+                        for err_str in ['错误!未找到引用源。', '错误！未找到引用源。',
+                                        'Error! Reference source not found.']:
+                            word.Selection.HomeKey(Unit=6)
+                            find = word.Selection.Find
+                            find.ClearFormatting()
+                            find.Replacement.ClearFormatting()
+                            find.Text = err_str
+                            find.Replacement.Text = ''
+                            find.Execute(Replace=2)  # wdReplaceAll
+                    except Exception:
+                        pass
+
                 if migrated_count:
                     print(f"   🔄 已迁移 {migrated_count} 个旧版 Auto_Ref 域为纯文本")
                 if orphan_count:
@@ -1686,30 +1742,97 @@ def process_document(input_file, modify_in_place=False, stages=None):
                             word.Selection.Collapse(Direction=0)
                             continue
 
-                        # 向前探测前缀（"图 ", "Fig. " 等）
-                        probe_rng = doc.Range(max(0, rng.Start - 15), rng.Start)
-                        probe_text = probe_rng.Text
-                        
-                        # 查找紧挨着数字的前缀：使用硬空格符匹配，彻底杜绝跨越 \r, \n, \x0b 匹配到了上一行的 "图"
-                        m_prefix = re.search(r'(图|Fig\.?|Figure)[ \t\xA0\u3000]*$', probe_text, re.IGNORECASE)
-                        if m_prefix:
-                            # 扩展 rng 包含前缀
-                            rng.Start = probe_rng.Start + m_prefix.start()
+                        # 🛡️ 安全探测前缀（修复域代码偏移 bug）
+                        # 旧方案用 .Text 字符偏移计算 Range 位置，但域标记符（\x13\x14\x15）
+                        # 不出现在 .Text 中却占据 Range 位置，导致偏移错位、破坏相邻域代码。
+                        # 新方案：逐字符用 doc.Range(pos, pos+1) 扫描，Word 引擎自动跳过域标记符。
+                        prefix_start_pos = None
+                        scan_limit = max(0, rng.Start - 15)
+                        pos = rng.Start - 1
+
+                        # 第一步：从匹配位置向前跳过空白符
+                        while pos >= scan_limit:
                             try:
-                                # 直接替换 rng（而不是先清空）可以让 Word 原生继承周边的字重、颜色
-                                field_code = f"REF {bkmk_name} \\h".strip()
-                                field = doc.Fields.Add(rng, -1, field_code, True)
-                                # 域代码自动继承周围正文的字体、字号，不再强制设置
-                                
-                                # Advance cursor past the newly created field
-                                # to prevent Find from re-matching within field result
+                                c = doc.Range(pos, pos + 1).Text
+                            except Exception:
+                                break
+                            if c in (' ', '\t', '\xA0', '\u3000'):
+                                pos -= 1
+                            else:
+                                break
+
+                        # 第二步：检测前缀关键字
+                        if pos >= scan_limit:
+                            try:
+                                c = doc.Range(pos, pos + 1).Text
+                            except Exception:
+                                c = ''
+                            if c == '图':
+                                prefix_start_pos = pos
+                            elif c.lower() in ('.', 'g', 'e'):
+                                # 可能是 Fig./Figure，向前多读几个字符
+                                look_start = max(scan_limit, pos - 7)
                                 try:
-                                    field.Select()
-                                    word.Selection.Collapse(Direction=0)
+                                    look_text = doc.Range(look_start, pos + 1).Text
+                                    m_eng = re.search(r'(Fig\.?|Figure)$', look_text, re.IGNORECASE)
+                                    if m_eng:
+                                        prefix_start_pos = look_start + m_eng.start()
                                 except Exception:
                                     pass
-                            except Exception as e:
-                                print(f"      ⚠️ 图注域代码替换失败: {e}")
+
+                        # 第三步：安全验证——前缀区间内不能横跨域代码
+                        if prefix_start_pos is not None:
+                            safe = True
+                            try:
+                                chk = doc.Range(prefix_start_pos, rng.Start)
+                                if chk.Fields.Count > 0:
+                                    safe = False
+                            except Exception:
+                                pass
+                            # 额外防线：前缀前面不能紧跟段落标记以外的换行符（防跨段匹配）
+                            if safe and prefix_start_pos > 0:
+                                try:
+                                    prev_c = doc.Range(prefix_start_pos - 1, prefix_start_pos).Text
+                                    if prev_c in ('\r', '\n', '\x0b'):
+                                        safe = False
+                                except Exception:
+                                    pass
+                            if safe:
+                                rng.Start = prefix_start_pos
+                                try:
+                                    # 先保存被替换区间的字体属性，防止 Fields.Add 丢失格式
+                                    saved_font_size = rng.Font.Size
+                                    saved_font_name = rng.Font.Name
+                                    saved_font_name_fe = rng.Font.NameFarEast
+                                except Exception:
+                                    saved_font_size = None
+                                    saved_font_name = None
+                                    saved_font_name_fe = None
+                                try:
+                                    field_code = f"REF {bkmk_name} \\h".strip()
+                                    field = doc.Fields.Add(rng, -1, field_code, True)
+                                    
+                                    # 恢复字体格式，修复域代码字号变为5号的问题
+                                    try:
+                                        res_rng = field.Result
+                                        if saved_font_size and saved_font_size > 0:
+                                            res_rng.Font.Size = saved_font_size
+                                        if saved_font_name:
+                                            res_rng.Font.Name = saved_font_name
+                                        if saved_font_name_fe:
+                                            res_rng.Font.NameFarEast = saved_font_name_fe
+                                    except Exception:
+                                        pass
+                                    
+                                    # Advance cursor past the newly created field
+                                    # to prevent Find from re-matching within field result
+                                    try:
+                                        field.Select()
+                                        word.Selection.Collapse(Direction=0)
+                                    except Exception:
+                                        pass
+                                except Exception as e:
+                                    print(f"      ⚠️ 图注域代码替换失败: {e}")
                         
                         word.Selection.Collapse(Direction=0)
                 print("   ⏳ 正在全篇刷新图注动态交叉引用...")
