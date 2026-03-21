@@ -1,35 +1,97 @@
-# Word & MathType 自动化排版精灵 🪄
+# 🤖 DocMaster Agent
 
-本项目包含两个基于 Python 开发的自动化脚本，专门用于解决学术论文写作、排版过程中的 Word 参考文献交叉引用、图注格式化以及 LaTeX 公式批量转 MathType 的繁琐问题。带有图形交互界面（GUI），操作简单直观。
+**学术论文排版 AI 智能助手** —— 通过自然语言指令驱动 Word 文档自动化处理。
 
-## 📦 包含脚本
+基于 **ReAct (Reasoning + Acting)** 架构，参考 [OpenManus](https://github.com/FoundationAgents/OpenManus) 和 [smolagents](https://github.com/huggingface/smolagents) 设计理念打造的轻量级 AI Agent 项目。
 
-### 1. Word 文献自动化精灵 (`Word文献自动化精灵.py`)
-用于 Word 文档的参考文献与图注自动化排版，支持多阶段自由组合执行：
-* **阶段 A**：参考文献格式修复与排版（统一字体字号、Sentence Case 处理、期刊名自动斜体）。
-* **阶段 B**：自动生成参考文献 `[数字]` 交叉引用，将正文引用替换为可跳转的域代码。
-* **阶段 C**：自动生成图注交叉引用。
-* **阶段 D**：手写图注转 Word 题注（支持自动编号与 SEQ 域代码生成）。
-* **阶段 E**：智能检测专业缩写在首次出现时是否定义了全称。
+## ✨ 功能
 
-### 2. LaTeX 转 MathType 批量转换器 (`latex.py`)
-在 Word 文档中，将手写的 LaTeX 公式（如 `$x^2$` 或 `$$...$$`）批量原地转换为 MathType 公式（OLE 对象）：
-* 支持 `.doc` 自动转 `.docx`。
-* 支持 **安全模式**（另存为新文件）和 **覆盖模式**（自动备份原文件）。
-* 智能识别公式并提供全篇预扫描，支持输入编号**排除特定公式**不作转换。
-* 修复了剪贴板泄漏等问题，支持运行进度与计数显示。
+| 工具 | 功能描述 |
+|------|---------|
+| `format_references` | 参考文献格式修复（字体统一、Sentence Case、期刊名斜体） |
+| `create_reference_crossrefs` | 文献交叉引用生成（[1][2] → 可跳转域代码） |
+| `create_figure_crossrefs` | 图注交叉引用生成（图X.Y → 可跳转域代码） |
+| `convert_handwritten_captions` | 手写图注转 Word 题注（支持自动编号） |
+| `check_acronym_definitions` | 缩写定义检测（检测 MIMO 等缩写是否有全称） |
+| `convert_latex_to_mathtype` | LaTeX 公式 → MathType 批量转换 |
 
-## 🛠️ 运行环境要求
+## 🚀 快速开始
 
-* **操作系统**：Windows (脚本依赖 Windows API 操控 Office)
-* **前置软件**：
-  * 已安装 Microsoft Word
-  * 已安装 MathType (仅运行 `latex.py` 时需要)
-* **Python 版本**：Python 3.x (需勾选安装 tcl/tk 以支持 GUI)
+### 1. 安装依赖
 
-## 🚀 安装与使用
+```bash
+pip install -r requirements.txt
+```
 
-1. 克隆或下载本项目到本地。
-2. 安装必要的第三方依赖库：
-   ```bash
-   pip install -r requirements.txt
+### 2. 配置 LLM API
+
+```bash
+cp config/config.example.toml config/config.toml
+```
+
+编辑 `config/config.toml`，填入你的 API Key。推荐使用免费方案：
+
+| 方案 | 申请地址 | 免费额度 |
+|------|---------|---------|
+| **Google Gemini** | [aistudio.google.com](https://aistudio.google.com/apikey) | 每天 1500 次请求 |
+| **智谱 GLM-4-Flash** | [open.bigmodel.cn](https://open.bigmodel.cn/) | 永久免费 |
+| **硅基流动** | [siliconflow.cn](https://cloud.siliconflow.cn/) | 注册送 2000 万 Token |
+
+### 3. 测试连接
+
+```bash
+python main.py --test
+```
+
+### 4. 开始使用
+
+```bash
+python main.py
+```
+
+然后输入自然语言指令，如：
+- `帮我格式化参考文献`
+- `生成文献交叉引用`
+- `检查一下缩写有没有定义`
+- `把图注转成Word题注，然后生成图注交叉引用`
+
+## 🏗️ 项目架构
+
+```
+agent/
+├── config/config.toml          # LLM 配置
+├── core/
+│   ├── schema.py               # 数据模型
+│   ├── llm.py                  # LLM 接口封装
+│   ├── agent.py                # ReAct Agent 核心循环
+│   └── prompt.py               # Prompt 模板
+├── tools/
+│   ├── base.py                 # Tool 基类 + 注册表
+│   ├── ref_formatter.py        # 阶段A
+│   ├── ref_crossref.py         # 阶段B
+│   ├── fig_crossref.py         # 阶段C
+│   ├── fig_caption.py          # 阶段D
+│   ├── acronym_checker.py      # 阶段E
+│   └── latex_converter.py      # LaTeX转换
+├── Word文献自动化精灵.py        # 原始脚本（被Tool引用）
+├── latex.py                    # 原始脚本（被Tool引用）
+└── main.py                     # 入口
+```
+
+## 🧠 工作原理
+
+```
+用户: "帮我处理参考文献格式和交叉引用"
+  ↓
+Agent (LLM推理): 需要先调用 format_references，再调用 create_reference_crossrefs
+  ↓
+执行 Tool 1: format_references → 格式修复完成
+  ↓
+执行 Tool 2: create_reference_crossrefs → 交叉引用生成完成
+  ↓
+Agent: "已完成！格式修复处理了25条文献，交叉引用替换了42处引用。"
+```
+
+## 📄 License
+
+MIT

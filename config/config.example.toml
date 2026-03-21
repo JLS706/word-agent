@@ -1,0 +1,41 @@
+# ==============================================================================
+# DocMaster Agent 配置文件
+# 复制此文件为 config.toml，然后填入你的 API Key
+# ==============================================================================
+
+# LLM 模型配置
+# 支持所有兼容 OpenAI SDK 格式的 API 平台
+[llm]
+
+# ── 方案1: Google Gemini（推荐，免费额度最大）──
+# 申请地址: https://aistudio.google.com/apikey
+model = "gemini-2.5-flash"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+api_key = "YOUR_GEMINI_API_KEY"
+
+# ── 方案2: 智谱 GLM-4-Flash（永久免费，国内快）──
+# 申请地址: https://open.bigmodel.cn/
+# model = "glm-4-flash"
+# base_url = "https://open.bigmodel.cn/api/paas/v4/"
+# api_key = "YOUR_ZHIPU_API_KEY"
+
+# ── 方案3: 硅基流动 SiliconFlow（注册送2000万Token）──
+# 申请地址: https://cloud.siliconflow.cn/
+# model = "deepseek-ai/DeepSeek-V3"
+# base_url = "https://api.siliconflow.cn/v1/"
+# api_key = "YOUR_SILICONFLOW_API_KEY"
+
+# ── 方案4: DeepSeek 官方（新用户送500万Token）──
+# 申请地址: https://platform.deepseek.com/
+# model = "deepseek-chat"
+# base_url = "https://api.deepseek.com/v1/"
+# api_key = "YOUR_DEEPSEEK_API_KEY"
+
+# 通用参数
+max_tokens = 4096
+temperature = 0.0
+
+# Agent 行为配置
+[agent]
+max_steps = 10      # 最大推理-执行循环次数
+verbose = true       # 是否打印详细调试信息

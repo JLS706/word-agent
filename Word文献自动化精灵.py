@@ -12,21 +12,23 @@ import win32com.client
 import os
 import re
 import traceback
+import hashlib
 
 # ==============================================================================
 # 第一部分：全局常量与工具函数
 # ==============================================================================
 
 FIG_CAPTION_PATTERN = re.compile(
-    r'^\s*((?:图|Fig\.?|Figure)\s*\d+(?:[\.\-]\s*\d+)?\s*(?:\([a-zA-Z]\))?)',
+    r'^\s*((?:图|Fig\.?|Figure)\s*\d+(?:[\.\-]\s*(?:\d+|[A-Za-z]+))?\s*(?:\([a-zA-Z]\))?)',
     re.IGNORECASE
 )
 
 # 匹配手写图注，提取章节号、图号、子图后缀、描述文字
 # 例: "图 1.3 系统模型框图" → ("图", "1", "3", None, "系统模型框图")
 # 例: "图 1.1(a) 发射端" → ("图", "1", "1", "(a)", "发射端")
+# 例: "图 1.A ISAC系统" → ("图", "1", "A", None, "ISAC系统") ← 草稿占位符
 FIG_HANDWRITTEN_PATTERN = re.compile(
-    r'^\s*(图|Fig\.?|Figure)\s*(\d+)[.\-](\d+)\s*(\([a-zA-Z]\))?\s*(.*)',
+    r'^\s*(图|Fig\.?|Figure)\s*(\d+)[.\-](\d+|[A-Za-z]+)\s*(\([a-zA-Z]\))?\s*(.*)',
     re.IGNORECASE
 )
 
@@ -345,6 +347,16 @@ _REF_TYPE_FALLBACK = re.compile(
 _STOP_KEYWORDS = ["致谢", "附录", "基金项目", "作者简介", "Biography",
                    "Acknowledgment", "Appendix", "Foundation"]
 
+# 阶段E检测缩写定义时，遇到这些关键词所在段落则停止扫描（它们标志着正文结束）
+_ACRONYM_STOP_KEYWORDS = [
+    "参考文献", "致谢", "附录", "基金项目", "作者简介",
+    "项目负责人", "主要参与者", "研究基础", "工作条件",
+    "代表性成果", "经费预算", "研究经历", "承担科研项目",
+    "发表论文", "代表性论文", "主要论著", "获奖情况",
+    "Biography", "Acknowledgment", "Appendix", "Foundation",
+    "References", "REFERENCES",
+]
+
 # 匹配参考文献中类型标签后面的期刊名/会议名
 # 例: [J]. IEEE Trans. Signal Processing, 2023
 #     [C]// Proc. IEEE ICASSP. 2023
@@ -495,6 +507,20 @@ def _extract_ref_num_from_para(para, text):
     return None
 
 
+def _make_ref_bookmark_name(text):
+    """根据参考文献内容生成稳定的书签名（不依赖编号）。
+    同一条文献无论排在第几，书签名始终一致，避免重排后引用错位。
+    """
+    # 去掉开头的编号前缀（如 [1]、【1】、1. 等）
+    clean = re.sub(r'^[\[\u3010]?\d+[\]\u3011]?[.\u3001]?\s*', '', text.strip())
+    # 取前60个字符作为稳定特征（通常包含作者名和标题开头）
+    clean = clean[:60].strip()
+    if not clean:
+        clean = text[:60]
+    h = hashlib.md5(clean.encode('utf-8', errors='ignore')).hexdigest()[:10]
+    return f"ARef_{h}"
+
+
 # ==============================================================================
 # 核心处理函数
 # ==============================================================================
@@ -505,9 +531,8 @@ def check_acronym_definitions(doc):
     
     seen_acronyms = {} 
     issues = []
-    in_ref_section = False
-    non_ref_streak = 0
     prev_text = ""  # 保留前一段文本，有时定义跨段落
+    body_ended = False  # 一旦遇到停止关键词，后续全部跳过
 
     for i in range(1, doc.Paragraphs.Count + 1):
         try:
@@ -517,36 +542,20 @@ def check_acronym_definitions(doc):
             if not text or len(text) < 3:
                 continue
             
-            # 2. 识别参考文献区域并跳过（基于格式特征检测边界）
             stripped = text.strip()
-            if not in_ref_section:
-                if "参考文献" in stripped and len(stripped) < 50:
-                    in_ref_section = True
-                    non_ref_streak = 0
-                    continue  # 跳过"参考文献"标题本身
-            else:
-                # 判断当前段落是否仍然是参考文献格式
-                is_ref_format = False
-                # 特征1: 自动编号 或 [数字] 开头
-                if _is_ref_start(para):
-                    is_ref_format = True
-                # 特征2: 包含文献类型标记 [J] [C] [M] [P] [D] [S] 等
-                if re.search(r'[\[【][A-Z]{1,4}(?:/[A-Z]{1,2})?[\]】]', stripped):
-                    is_ref_format = True
-                
-                if is_ref_format:
-                    non_ref_streak = 0
-                    continue  # 仍在参考文献区域，跳过
-                elif len(stripped) > 10:
-                    # 非空非短段落但不是参考文献格式 → 可能已离开参考文献区
-                    non_ref_streak += 1
-                    if non_ref_streak >= 2:
-                        in_ref_section = False
-                        # 当前段落已经是正文，不要 continue，继续检测缩写
-                    else:
-                        continue  # 给一次容错（可能是跨行的参考文献续行）
-                else:
-                    continue  # 空行或极短行，跳过
+            
+            # 正文结束检测：遇到"参考文献""项目负责人"等标志性段落后，
+            # 直接停止扫描，因为后续内容（文献列表、简历、专利）不需要缩写定义
+            if not body_ended:
+                if len(stripped) < 60:
+                    for kw in _ACRONYM_STOP_KEYWORDS:
+                        if kw in stripped:
+                            body_ended = True
+                            print(f"   📍 在第 {i} 段遇到 \"{kw}\"，停止缩写扫描")
+                            break
+            
+            if body_ended:
+                continue
             
             # 跳过很短的粗体标题行（章节标题）
             try:
@@ -563,11 +572,17 @@ def check_acronym_definitions(doc):
             for match in ACRONYM_PATTERN.finditer(text_norm):
                 acronym = match.group()
                 
-                # 排除太短的匹配
-                if len(acronym) < 2:
+                # 排除太短的匹配（2个字符太容易误报，如 UE, ID, IP, CL, US）
+                if len(acronym) < 3:
                     continue
                 # 排除纯数字开头且只有数字+一个字母的情况（如 "5G"、"3D"）
                 if re.fullmatch(r'\d+[A-Z]', acronym):
+                    continue
+                # 排除字母+长数字串：专利号、课题号等（如 ZL202510490604, MCM201302311）
+                if re.fullmatch(r'[A-Z]{1,4}\d{4,}', acronym):
+                    continue
+                # 排除单字母+短数字的模型/变量名后缀（如 R15, R5, P720, B2, Q1）
+                if re.fullmatch(r'[A-Z]\d+', acronym):
                     continue
                 
                 if acronym not in seen_acronyms:
@@ -786,8 +801,12 @@ def process_document(input_file, modify_in_place=False, stages=None):
                 count = 0
                 for entry in ref_entries:
                     full_text = entry['full_text']
-                    if not re.search(r'[\[【][A-Z]{1,4}(?:/[A-Z]{1,2})?[\]】]', full_text):
+                    first_para = all_paras_cache[entry['para_indices'][0]][1]
+                    
+                    # 取消严格标签限制，允许只有数字编号即可处理
+                    if not _is_ref_start(first_para) and not re.search(r'[\[【][A-Z]{1,4}(?:/[A-Z]{1,2})?[\]】]', full_text):
                         continue
+                        
                     count += 1
                     for cache_idx in entry['para_indices']:
                         _, para, _ = all_paras_cache[cache_idx]
@@ -796,8 +815,6 @@ def process_document(input_file, modify_in_place=False, stages=None):
                             full_rng.Font.Size = 10.5
                             full_rng.Font.NameFarEast = "宋体"
                             full_rng.Font.Name = "Times New Roman"
-                            para.Format.LineSpacingRule = 4
-                            para.Format.LineSpacing = 15
                         except Exception:
                             pass
 
@@ -846,8 +863,12 @@ def process_document(input_file, modify_in_place=False, stages=None):
         # 阶段 D：手写图注转 Word 题注 —— 必须在阶段C之前执行
         # =============================================================
         if not stages.get('D', False):
+            draft_fig_map = {}  # 即使跳过D，也初始化空映射供C使用
             print("\n⏭️ [阶段D] 已跳过（用户未勾选）")
         else:
+            # 草稿图号映射表（跨阶段共享：D→C）
+            draft_fig_map = {}
+
             print("\n🏷️ [阶段D] 正在将手写图注转换为 Word 题注...")
 
             # ── 步骤1：扫描所有段落，识别手写图注 ──
@@ -983,6 +1004,44 @@ def process_document(input_file, modify_in_place=False, stages=None):
                 # ── 步骤4：刷新所有域代码 ──
                 print("   ⏳ 正在刷新所有域代码...")
                 doc.Fields.Update()
+
+                # ── 步骤5：构建草稿编号→正式编号映射表 ──
+                # 读取转换后的题注，提取 SEQ 生成的新编号，
+                # 建立 "1.A" → "1.2" 这样的映射，供阶段C使用。
+                draft_fig_map = {}
+                for fig in figure_entries:
+                    old_core = f"{fig['chapter']}.{fig['fig_num']}"
+                    # 如果 fig_num 本身就是纯数字且较小，可能不是草稿占位符，跳过
+                    # 只对非纯数字或大编号（可能是占位符如99）建立映射
+                    is_draft = not fig['fig_num'].isdigit()
+                    try:
+                        para = doc.Paragraphs(fig['para_index'])
+                        new_text = _get_paragraph_text_safe(para)
+                        new_match = FIG_CAPTION_PATTERN.match(new_text)
+                        if new_match:
+                            new_label = new_match.group(1)
+                            new_core_m = re.search(
+                                r'\d+(?:\s*[\.\-]\s*(?:\d+|[A-Za-z]+))?',
+                                new_label
+                            )
+                            if new_core_m:
+                                new_core = re.sub(r'\s+', '', new_core_m.group())
+                                if old_core != new_core:
+                                    draft_fig_map[old_core] = new_core
+                                    is_draft = True
+                        if is_draft and old_core not in draft_fig_map:
+                            # 如果无法读取新编号，至少记录下来，后续尝试匹配
+                            draft_fig_map[old_core] = None
+                    except Exception:
+                        if is_draft:
+                            draft_fig_map[old_core] = None
+
+                if draft_fig_map:
+                    print(f"   📋 记录了 {len(draft_fig_map)} 个草稿编号待映射")
+                    for old_c, new_c in draft_fig_map.items():
+                        if new_c:
+                            print(f"      {old_c} → {new_c}")
+
                 print(f"   🎉 手写图注转换完成，共转换 {converted} 个题注")
 
         # =============================================================
@@ -993,43 +1052,259 @@ def process_document(input_file, modify_in_place=False, stages=None):
         else:
             print("\n🔗 [阶段B] 正在执行动态交叉引用生成...")
 
+            # ── 第1步：预扫描参考文献列表，计算所有有效的哈希书签名 ──
+            # 在动任何域代码之前，先确定哪些 ARef_{hash} 是当前有效的。
+            # 这样才能区分"论文还在(保留域)" vs "论文已删(清理域)"。
             boundary_rng = None
             for para in doc.Paragraphs:
                 text = para.Range.Text.strip()
                 if "参考文献" in text and len(text) < 50:
                     boundary_rng = para.Range
-                    doc.Bookmarks.Add("Ref_Boundary_Marker", boundary_rng)
                     break
 
             if not boundary_rng:
                 print("   ⚠️ 未找到【参考文献】红线，无法生成交叉引用，强制跳过。")
             else:
-                bookmark_map = {}
+                # 预扫描：收集当前参考文献列表中所有论文的哈希书签名
                 initial_boundary_pos = boundary_rng.Start
+                valid_hashes = set()     # 当前有效的 ARef_{hash} 集合
+                bookmark_map = {}        # "[N]" -> (bkmk_name, "\\n")
+                ref_para_data = []       # (para, text, num, bkmk_name) 待创建书签
 
                 for para in doc.Paragraphs:
                     if para.Range.Start >= initial_boundary_pos:
-                        text = para.Range.Text.strip()
-                        if not re.search(r'[\[【][A-Z]{1,4}(?:/[A-Z]{1,2})?[\]】]', text):
+                        text = _get_paragraph_text_safe(para)
+                        if not text or len(text.strip()) < 5:
                             continue
                         num = _extract_ref_num_from_para(para, text)
                         if num is None:
-                            print(f"   ⚠️ 跳过：无法提取纯数字编号，原文: {text[:60]}")
                             continue
-                        bkmk_name = f"Auto_Ref_{num}"
+                        bkmk_name = _make_ref_bookmark_name(text)
+                        valid_hashes.add(bkmk_name)
                         target_text = f"[{num}]"
-                        if target_text in bookmark_map:
-                            print(f"   ⚠️ 编号 {target_text} 重复，保留先登记的书签，跳过: {text[:60]}")
-                            continue
-                        try:
-                            doc.Bookmarks.Add(bkmk_name, para.Range)
+                        if target_text not in bookmark_map:
                             bookmark_map[target_text] = (bkmk_name, "\\n")
-                            print(f"   📌 登记书签: {target_text} -> {bkmk_name}")
-                        except Exception as e:
-                            print(f"   ⚠️ 添加书签失败 ({bkmk_name}): {e}")
+                            ref_para_data.append((para, text, num, bkmk_name))
+
+                print(f"   📋 预扫描完毕：当前参考文献 {len(valid_hashes)} 条")
+
+                # ── 第2步：智能清理旧域代码 ──
+                # 核心策略：
+                #   - Auto_Ref_N 域：一律 Unlink（旧命名，需要迁移）
+                #   - ARef_{hash} 且 hash 在 valid_hashes 中：保留！
+                #     它们通过 \n 开关在 Fields.Update() 时自动更新显示编号，
+                #     这正是内容哈希书签的设计目的——论文增删后编号自动跟随。
+                #   - ARef_{hash} 且 hash 不在 valid_hashes 中：Unlink（论文已删除）
+                migrated_count = 0
+                orphan_count = 0
+                kept_count = 0
+                try:
+                    for fi in range(doc.Fields.Count, 0, -1):
+                        try:
+                            fld = doc.Fields(fi)
+                            code_text = fld.Code.Text
+                            m = re.search(r'(ARef_[a-f0-9]+|Auto_Ref_\d+)', code_text)
+                            if not m:
+                                continue
+                            field_bkmk = m.group()
+
+                            if field_bkmk.startswith('Auto_Ref_'):
+                                # 旧命名：一律迁移
+                                fld.Unlink()
+                                migrated_count += 1
+                            elif field_bkmk in valid_hashes:
+                                # 哈希匹配：论文还在，保留域代码
+                                kept_count += 1
+                            else:
+                                # 哈希不匹配：论文已被删除
+                                fld.Unlink()
+                                orphan_count += 1
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+
+                if migrated_count:
+                    print(f"   🔄 已迁移 {migrated_count} 个旧版 Auto_Ref 域为纯文本")
+                if orphan_count:
+                    print(f"   ⚠️ 清理了 {orphan_count} 个孤儿域（对应文献已被删除）")
+                if kept_count:
+                    print(f"   ✅ 保留了 {kept_count} 个有效的哈希引用域（编号将自动更新）")
+
+                # ── 第3步：删除旧书签并重新创建 ──
+                try:
+                    for bi in range(doc.Bookmarks.Count, 0, -1):
+                        try:
+                            bkmk = doc.Bookmarks(bi)
+                            if (bkmk.Name.startswith('ARef_') or
+                                bkmk.Name.startswith('Auto_Ref_') or
+                                bkmk.Name == 'Ref_Boundary_Marker'):
+                                bkmk.Delete()
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+
+                # 创建边界标记书签
+                doc.Bookmarks.Add("Ref_Boundary_Marker", boundary_rng)
+
+                # 创建参考文献书签
+                for para, text, num, bkmk_name in ref_para_data:
+                    target_text = f"[{num}]"
+                    try:
+                        doc.Bookmarks.Add(bkmk_name, para.Range)
+                        print(f"   📌 登记书签: {target_text} -> {bkmk_name}")
+                    except Exception as e:
+                        print(f"   ⚠️ 添加书签失败 ({bkmk_name}): {e}")
 
                 if bookmark_map:
                     print(f"   ✅ 提取 {len(bookmark_map)} 条书签，开始正文替换...")
+                    
+                    # ====== 核心修复：采用最简单直白的规则判断是否设为上标 ======
+                    # 规则1：如果前面紧挨着“文献”两个字（如：文献[x]），绝对不上标。
+                    # 规则2：如果后面跟着符号“-”、“~”、“,”等且带左括号（如：[25]-[28]），作为组合连续引用，不上标。
+                    # 规则3：其他所有情况，全部上标。
+                    def _check_superscript(match_start, match_end):
+                        try:
+                            # 1. 检查前面是不是“文献”
+                            # 取前面3个字符（容忍中间可能有的1个空格）
+                            before_chars = doc.Range(max(0, match_start - 3), match_start).Text
+                            if before_chars and "文献" in before_chars:
+                                return False
+                            
+                            # 1.5 检查前面是不是引用组合的后半部分 (如 "[25]-[28]" 中的 [28])
+                            # 如果前面紧挨着 ]-、]~、]–、]— 等连接符，说明是复合引用的尾部，不上标
+                            before_wide = doc.Range(max(0, match_start - 10), match_start).Text
+                            if before_wide:
+                                stripped_before = before_wide.rstrip(' \t\r\n')
+                                if stripped_before:
+                                    if re.search(r'[\]】\u3011][\-~～,，、\u2013\u2014]+$', stripped_before):
+                                        return False
+                                
+                            # 2. 检查后面是不是引用组合的连接符 (如 "[25]-[28]")
+                            after_chars = doc.Range(match_end, min(doc.Content.End, match_end + 10)).Text
+                            if after_chars:
+                                stripped_after = after_chars.lstrip(' \t\r\n')
+                                if stripped_after:
+                                    # 如果后面跟着连续的连接符再加上左括号，说明它是引用组合的前半部分，不设上标
+                                    # 涵盖 Word 自动转换的 En-dash (\u2013) 和 Em-dash (\u2014)
+                                    if re.match(r'^[\-~～,，、\u2013\u2014]+[\[【\u3010]', stripped_after):
+                                        return False
+                            
+                            # 3. 其余所有情况，均上标
+                            return True
+                        except Exception:
+                            return True
+
+                    # ====== 新增：提取并处理复合交叉引用（如 [13-15], [1, 2]） ======
+                    compound_targets = set()
+                    for para in doc.Paragraphs:
+                        text = para.Range.Text
+                        # 匹配类似 [13-15], 【1, 2】, [1,2,3-5]
+                        # 注意：Word 会将 - 自动转换为 en-dash(\u2013) 或 em-dash(\u2014)
+                        for match in re.finditer(r'[\[【]\s*(\d+(?:\s*[,，\-~～\u2013\u2014]\s*\d+)+)\s*[\]】]', text):
+                            compound_targets.add(match.group(0))
+                            
+                    if compound_targets:
+                        print(f"   🔍 发现并处理 {len(compound_targets)} 种组合引用，如 {list(compound_targets)[:3]}...")
+                        # 按照长度从长到短排序，避免短的字符串包含在长的字符串内部
+                        for comp_target in sorted(compound_targets, key=len, reverse=True):
+                            word.Selection.HomeKey(Unit=6)
+                            find = word.Selection.Find
+                            find.ClearFormatting()
+                            find.Text = comp_target
+                            find.MatchWholeWord = False
+                            find.MatchWildcards = False
+                            while find.Execute():
+                                rng = word.Selection.Range
+                                current_boundary = (
+                                    doc.Bookmarks("Ref_Boundary_Marker").Range.Start
+                                    if doc.Bookmarks.Exists("Ref_Boundary_Marker")
+                                    else doc.Content.End
+                                )
+                                if rng.Start >= current_boundary:
+                                    break
+                                
+                                # Skip if match is inside an existing field
+                                is_in_field = False
+                                try:
+                                    for fld in rng.Paragraphs(1).Range.Fields:
+                                        try:
+                                            if rng.Start >= fld.Code.Start - 1 and rng.End <= fld.Result.End + 1:
+                                                is_in_field = True
+                                                break
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
+                                if is_in_field:
+                                    word.Selection.Collapse(Direction=0)
+                                    continue
+                                
+                                # 智能判断复合引用是否作为主语/宾语
+                                is_super = _check_superscript(rng.Start, rng.End)
+                                
+                                try:
+                                    rng.Select()
+                                    word.Selection.Text = ""
+                                    
+                                    # ====== 修改：根据语境决定是否设为上标 ======
+                                    if is_super:
+                                        word.Selection.Font.Superscript = True
+                                        
+                                    # 提取括号内部的内容 e.g. "13-15"
+                                    inner_text = re.search(r'[\[【]\s*(.*?)\s*[\]】]', comp_target).group(1)
+                                    
+                                    needs_outer_brackets = True
+                                    word.Selection.TypeText("[")
+                                    # 记录左括号位置，若自带括号则最后删除
+                                    bracket_pos = word.Selection.Start - 1
+                                    
+                                    # 按数字和非数字分割
+                                    # 先将 en-dash/em-dash 统一替换为普通连字符，保证后续处理一致
+                                    inner_text = inner_text.replace('\u2013', '-').replace('\u2014', '-')
+                                    tokens = re.split(r'(\d+)', inner_text)
+                                    for token in tokens:
+                                        if not token:
+                                            continue
+                                        if token.isdigit():
+                                            bkmk_key = f"[{token}]"
+                                            if bkmk_key in bookmark_map:
+                                                bkmk_name, field_switch = bookmark_map[bkmk_key]
+                                                # 使用 \# "0" 数字开关，强制剔除源列表带有中括号生成的 [13]，使其纯净变为 13
+                                                field_code = f"REF {bkmk_name} {field_switch} \\h \\# \"0\"".strip()
+                                                
+                                                field = doc.Fields.Add(word.Selection.Range, -1, field_code, True)
+                                                
+                                                res_txt = field.Result.Text
+                                                # 如果依然有中括号 (有些版本Word可能不吃 \# "0")，那我们就记录下来
+                                                if "[" in res_txt or "【" in res_txt:
+                                                    needs_outer_brackets = False
+                                                    
+                                                # ==== 核心修复 ====
+                                                # 从整个域代码(包括暗箱标记)中彻底跳出，防止后续字符被填入 Result 被 Update() 抹去。
+                                                field.Select()
+                                                word.Selection.Collapse(Direction=0)
+                                            else:
+                                                word.Selection.TypeText(token)
+                                        else:
+                                            word.Selection.TypeText(token)
+                                            
+                                    if needs_outer_brackets:
+                                        word.Selection.TypeText("]")
+                                    else:
+                                        # 如果本身自带括号，就删开头的占位左括号 "["
+                                        doc.Range(bracket_pos, bracket_pos + 1).Text = ""
+                                        
+                                    # 恢复为非上标状态，以免影响后续正文
+                                    if is_super:
+                                        word.Selection.Font.Superscript = False
+                                        
+                                except Exception as e:
+                                    print(f"      ⚠️ 组合引用替换失败 ({comp_target}): {e}")
+                                word.Selection.Collapse(Direction=0)
+
+                    # ====== 处理单一引用 [X] ======
                     sorted_targets = sorted(bookmark_map.keys(), key=len, reverse=True)
                     for target_text in sorted_targets:
                         bkmk_name, field_switch = bookmark_map[target_text]
@@ -1048,15 +1323,135 @@ def process_document(input_file, modify_in_place=False, stages=None):
                             )
                             if rng.Start >= current_boundary:
                                 break
+                            
+                            # Skip if match is inside an existing field
+                            is_in_field = False
+                            try:
+                                for fld in rng.Paragraphs(1).Range.Fields:
+                                    try:
+                                        if rng.Start >= fld.Code.Start - 1 and rng.End <= fld.Result.End + 1:
+                                            is_in_field = True
+                                            break
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                            if is_in_field:
+                                word.Selection.Collapse(Direction=0)
+                                continue
+                            
+                            # 根据括号后第一个字符预判是否该上标
+                            is_super = _check_superscript(rng.Start, rng.End)
+                            
                             try:
                                 rng.Text = ""
+                                rng.Select()
+                                
+                                # ====== 修改：根据语境决定单一文献是否设为上标 ======
+                                if is_super:
+                                    word.Selection.Font.Superscript = True
+                                
                                 field_code = f"REF {bkmk_name} {field_switch} \\h".strip()
-                                doc.Fields.Add(rng, -1, field_code, True)
+                                doc.Fields.Add(word.Selection.Range, -1, field_code, True)
+                                
+                                # ====== 恢复：如果刚才设了上标，需恢复成普通文本以免影响后续输入 ======
+                                word.Selection.Collapse(Direction=0)
+                                if is_super:
+                                    word.Selection.Font.Superscript = False
+                                
                             except Exception as e:
                                 print(f"      ⚠️ 域代码替换失败 ({target_text}): {e}")
                             word.Selection.Collapse(Direction=0)
                     print("   ⏳ 正在全篇刷新文献动态交叉引用...")
                     doc.Fields.Update()
+                    
+                    # ── 验证：检查所有文献交叉引用是否指向正确的目标 ──
+                    print("   🔍 正在验证文献交叉引用的正确性...")
+                    ref_issues = []
+                    current_boundary = (
+                        doc.Bookmarks("Ref_Boundary_Marker").Range.Start
+                        if doc.Bookmarks.Exists("Ref_Boundary_Marker")
+                        else doc.Content.End
+                    )
+                    for fi in range(1, doc.Fields.Count + 1):
+                        try:
+                            fld = doc.Fields(fi)
+                            if fld.Code.Start >= current_boundary:
+                                continue
+                            code_text = fld.Code.Text.strip()
+                            result_text = fld.Result.Text.strip()
+                            
+                            if not code_text.upper().startswith('REF '):
+                                continue
+                            
+                            result_nums = re.findall(r'\d+', result_text)
+                            if not result_nums:
+                                continue
+                            is_ref_citation = bool(re.search(r'[\[\u3010]?\d+[\]\u3011]?', result_text))
+                            if not is_ref_citation:
+                                continue
+                            
+                            bkmk_match = re.search(r'REF\s+(\S+)', code_text, re.IGNORECASE)
+                            if not bkmk_match:
+                                continue
+                            bkmk_name = bkmk_match.group(1)
+                            
+                            # Get paragraph number and surrounding context for locating
+                            try:
+                                fld_para = fld.Code.Paragraphs(1)
+                                para_text = fld_para.Range.Text.strip()
+                                # Find field position in paragraph for context
+                                fld_pos = fld.Result.Start - fld_para.Range.Start
+                                ctx_start = max(0, fld_pos - 30)
+                                ctx_end = min(len(para_text), fld_pos + 30)
+                                context = para_text[ctx_start:ctx_end].replace('\r', '').replace('\n', '')
+                                # Count paragraph index
+                                para_num = 0
+                                for pi in range(1, doc.Paragraphs.Count + 1):
+                                    if doc.Paragraphs(pi).Range.Start == fld_para.Range.Start:
+                                        para_num = pi
+                                        break
+                            except Exception:
+                                context = ""
+                                para_num = 0
+                            
+                            loc_str = f"[{para_num}]" if para_num else ""
+                            
+                            if not doc.Bookmarks.Exists(bkmk_name):
+                                ref_issues.append(
+                                    f'  \u2022 {loc_str} \u663e\u793a"{result_text}" \u2192 \u4e66\u7b7e"{bkmk_name}"\u4e0d\u5b58\u5728\uff08\u5f15\u7528\u6e90\u4e22\u5931\uff09'
+                                    f'\n    \u5b9a\u4f4d: ...{context}...'
+                                )
+                                continue
+                            
+                            # \u5bf9\u4e8e\u975e\u672c\u811a\u672c\u521b\u5efa\u7684\u4ea4\u53c9\u5f15\u7528\uff0c\u68c0\u67e5\u4e66\u7b7e\u662f\u5426\u6307\u5411\u53c2\u8003\u6587\u732e\u533a\u57df
+                            is_script_ref = bkmk_name.startswith('ARef_') or bkmk_name.startswith('Auto_Ref_')
+                            if not is_script_ref:
+                                try:
+                                    bkmk_rng = doc.Bookmarks(bkmk_name).Range
+                                    if bkmk_rng.Start < current_boundary:
+                                        bkmk_para_text = _get_paragraph_text_safe(bkmk_rng.Paragraphs(1))
+                                        ref_issues.append(
+                                            f'  \u2022 {loc_str} \u663e\u793a"{result_text}" \u2192 \u975e\u811a\u672c\u4e66\u7b7e"{bkmk_name}"\uff0c\u6307\u5411\u6b63\u6587\u800c\u975e\u53c2\u8003\u6587\u732e\u533a'
+                                            f'\n    \u5b9a\u4f4d: ...{context}...'
+                                            f'\n    \u4e66\u7b7e\u6307\u5411: {bkmk_para_text[:50]}...'
+                                        )
+                                except Exception:
+                                    pass
+                        except Exception:
+                            continue
+                    
+                    if ref_issues:
+                        print(f"\n   {'!'*50}")
+                        print(f"   \u26a0\ufe0f  \u68c0\u6d4b\u5230 {len(ref_issues)} \u4e2a\u6587\u732e\u4ea4\u53c9\u5f15\u7528\u5f02\u5e38\uff1a")
+                        print(f"   {'-'*50}")
+                        for issue in ref_issues:
+                            print(f"   {issue}")
+                        print(f"   {'-'*50}")
+                        print(f"   \u63d0\u793a\uff1a\u8bf7\u624b\u52a8\u68c0\u67e5\u4e0a\u8ff0\u5f15\u7528\uff0c\u53ef\u80fd\u662f\u539f\u6587\u4e2d\u5df2\u6709\u7684\u9519\u8bef\u4ea4\u53c9\u5f15\u7528")
+                        print(f"   {'!'*50}")
+                    else:
+                        print("   \u2705 \u6587\u732e\u4ea4\u53c9\u5f15\u7528\u9a8c\u8bc1\u901a\u8fc7\uff0c\u672a\u53d1\u73b0\u5f02\u5e38")
                 else:
                     print("   ⚠️ 未成功建立任何文献书签，已跳过替换。")
 
@@ -1067,6 +1462,40 @@ def process_document(input_file, modify_in_place=False, stages=None):
             print("\n⏭️ [阶段C] 已跳过（用户未勾选）")
         else:
             print("\n🖼️ [阶段C] 正在执行图注(Figure)动态交叉引用生成...")
+
+            # ── 预处理：清理上一次运行残留的图注 REF 域和书签 ──
+            print("   🧹 正在清理旧的图注交叉引用域代码...")
+            fig_unlinked = 0
+            try:
+                for fi in range(doc.Fields.Count, 0, -1):
+                    try:
+                        fld = doc.Fields(fi)
+                        code_text = fld.Code.Text.strip()
+                        if code_text.startswith('REF _RefAutoFig_'):
+                            fld.Unlink()
+                            fig_unlinked += 1
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            fig_bkmk_del = 0
+            try:
+                for bi in range(doc.Bookmarks.Count, 0, -1):
+                    try:
+                        bkmk = doc.Bookmarks(bi)
+                        if bkmk.Name.startswith('_RefAutoFig_'):
+                            bkmk.Delete()
+                            fig_bkmk_del += 1
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            if fig_unlinked or fig_bkmk_del:
+                print(f"   ✅ 清理完毕：还原 {fig_unlinked} 个域代码，删除 {fig_bkmk_del} 个旧书签")
+            else:
+                print("   ℹ️  未发现旧的图注交叉引用，无需清理")
 
             fig_bookmark_map = {}
 
@@ -1097,7 +1526,7 @@ def process_document(input_file, modify_in_place=False, stages=None):
                 if is_valid_caption:
                     orig_fig_label = match.group(1).strip()
                     # 关键修复：加入 \s* 允许容忍跨越空格的数字提取（例如 "2. 13"）
-                    core_num_match = re.search(r'\d+(?:\s*[\.\-]\s*\d+)?(?:\s*\([a-zA-Z]\))?', orig_fig_label)
+                    core_num_match = re.search(r'\d+(?:\s*[\.\-]\s*(?:\d+|[A-Za-z]+))?(?:\s*\([a-zA-Z]\))?', orig_fig_label)
                     core_num_raw = core_num_match.group(0) if core_num_match else orig_fig_label
                     # 彻底净化：抹除所有空格，确保 core_num 严格变为 "2.13"，防范 Word Find 越界或短路
                     core_num = re.sub(r'\s+', '', core_num_raw)
@@ -1158,6 +1587,17 @@ def process_document(input_file, modify_in_place=False, stages=None):
                     except Exception as e:
                         print(f"      ⚠️ 添加图注书签因系统异常失败: {e}")
 
+            # ── 合并草稿编号映射：将 Stage D 记录的旧草稿编号加入搜索目标 ──
+            if draft_fig_map:
+                merged = 0
+                for old_core, new_core in draft_fig_map.items():
+                    if new_core and new_core in fig_bookmark_map and old_core not in fig_bookmark_map:
+                        fig_bookmark_map[old_core] = fig_bookmark_map[new_core]
+                        merged += 1
+                        print(f"   🔄 草稿引用映射: 图{old_core} → 图{new_core} (共享书签 {fig_bookmark_map[new_core]})")
+                if merged:
+                    print(f"   ✅ 共合并 {merged} 个草稿编号到搜索目标")
+
             if fig_bookmark_map:
                 print(f"   ✅ 共提取 {len(fig_bookmark_map)} 个合法图注段落，准备正文安全替换...")
 
@@ -1177,6 +1617,28 @@ def process_document(input_file, modify_in_place=False, stages=None):
                     
                     while find.Execute():
                         rng = word.Selection.Range
+
+                        # Guard: skip if match is inside an existing field (REF domain)
+                        # This prevents infinite loop when Find matches text within
+                        # a field result that was just created or already exists
+                        is_in_field = False
+                        try:
+                            para_fields = rng.Paragraphs(1).Range.Fields
+                            for fld in para_fields:
+                                try:
+                                    fld_start = fld.Code.Start - 1
+                                    fld_end = fld.Result.End + 1
+                                    if rng.Start >= fld_start and rng.End <= fld_end:
+                                        is_in_field = True
+                                        break
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                        if is_in_field:
+                            word.Selection.Collapse(Direction=0)
+                            continue
 
                         # ✅ 全局动态锚点防护盾
                         is_in_any_caption = False
@@ -1216,11 +1678,13 @@ def process_document(input_file, modify_in_place=False, stages=None):
                                 # 直接替换 rng（而不是先清空）可以让 Word 原生继承周边的字重、颜色
                                 field_code = f"REF {bkmk_name} \\h".strip()
                                 field = doc.Fields.Add(rng, -1, field_code, True)
+                                # 域代码自动继承周围正文的字体、字号，不再强制设置
                                 
-                                # 强制修复：将引用文字锁定为“小四”（12磅）
+                                # Advance cursor past the newly created field
+                                # to prevent Find from re-matching within field result
                                 try:
-                                    field.Result.Font.Size = 12
-                                    field.Code.Font.Size = 12
+                                    field.Select()
+                                    word.Selection.Collapse(Direction=0)
                                 except Exception:
                                     pass
                             except Exception as e:

@@ -1,0 +1,4 @@
+# DocMaster Agent 依赖
+openai>=1.0.0
+toml>=0.10.0
+pywin32>=306
