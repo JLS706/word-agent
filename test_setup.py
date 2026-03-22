@@ -17,6 +17,10 @@ from tools.fig_crossref import FigCrossRefTool
 from tools.fig_caption import FigCaptionTool
 from tools.acronym_checker import AcronymCheckerTool
 from tools.latex_converter import LatexConverterTool
+from tools.code_interpreter import CodeInterpreterTool
+from tools.learned_rules import (
+    SaveLearnedRuleTool, ForgetLearnedRuleTool, ListLearnedRulesTool
+)
 
 registry = ToolRegistry()
 tools = [
@@ -26,6 +30,10 @@ tools = [
     FigCaptionTool(),
     AcronymCheckerTool(),
     LatexConverterTool(),
+    CodeInterpreterTool(),
+    SaveLearnedRuleTool(),
+    ForgetLearnedRuleTool(),
+    ListLearnedRulesTool(),
 ]
 for t in tools:
     registry.register(t)

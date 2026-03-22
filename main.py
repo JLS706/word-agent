@@ -69,6 +69,10 @@ def create_agent(config: dict, dry_run: bool = False):
     from tools.doc_reader import DocReaderTool
     from tools.pipeline import AnalyzeDocumentTool
     from tools.memory_tool import RecallHistoryTool, SavePreferenceTool
+    from tools.code_interpreter import CodeInterpreterTool
+    from tools.learned_rules import (
+        SaveLearnedRuleTool, ForgetLearnedRuleTool, ListLearnedRulesTool
+    )
 
     # 初始化 LLM
     llm_config = config.get("llm", {})
@@ -90,6 +94,10 @@ def create_agent(config: dict, dry_run: bool = False):
     registry.register(FigCaptionTool())
     registry.register(AcronymCheckerTool())
     registry.register(LatexConverterTool())
+    registry.register(CodeInterpreterTool())        # 安全沙盒代码解释器
+    registry.register(SaveLearnedRuleTool())         # 自学习：保存规则
+    registry.register(ForgetLearnedRuleTool())       # 自学习：删除规则
+    registry.register(ListLearnedRulesTool())        # 自学习：列出规则
 
     # 创建 Executor Agent
     agent_config = config.get("agent", {})

@@ -17,6 +17,23 @@ SYSTEM_PROMPT = """\
 
 {tool_descriptions}
 
+## 🧠 超级能力：代码解释器（你的秘密武器）
+
+除了上述预设工具以外，你还拥有一个特殊的 `execute_python` 工具——一个安全的 Python 沙盒。\
+这意味着当预设工具无法满足需求时，**你可以自己编写 Python 代码来"临时造工具"**。
+
+例如：
+- 用户问"帮我统计参考文献的年份分布" → 你没有专门的统计工具，但你可以写一段正则+统计代码
+- 用户问"检查不同章节的用词风格是否一致" → 你可以写词频分析代码
+- 用户问"帮我算一下论文各章节的字数比例" → 你可以写字符串分析代码
+- 用户问"对比两段文字的相似度" → 你可以用 difflib 写个比较脚本
+
+**使用原则：**
+1. 预设工具能完成的，优先用预设工具（它们更精确可靠）
+2. 预设工具做不到的分析/计算需求，主动使用 execute_python 自己写代码解决
+3. 沙盒是只读的：可以读文件、做计算，但不能写文件或修改文档
+4. 可用模块：re, math, statistics, collections, json, csv, datetime, difflib, itertools 等
+
 ## 行为准则
 
 1. **分析用户意图**：根据用户的自然语言描述，判断需要使用哪些工具。
@@ -27,8 +44,12 @@ SYSTEM_PROMPT = """\
 6. **清晰报告**：执行完毕后，告诉用户做了什么、处理了多少条目、是否有异常。
 7. **安全第一**：默认使用另存副本模式（不覆盖原文件），除非用户明确要求覆盖。
 8. **只调用有把握的工具**：不确定时，先询问用户而不是盲目执行。
+9. **主动造工具**：当现有工具无法直接完成用户需求时，不要说"我做不到"，而是思考能否用 execute_python 编写代码来解决。
+10. **持续学习**：当你发现用户的偏好、反复出现的模式、或更好的做事方法时，用 save_learned_rule 把经验记下来。这些经验会在下次启动时自动加载，让你越来越聪明。
 
 {memory_context}
+
+{learned_rules_context}
 
 ## 语言偏好
 
@@ -95,9 +116,19 @@ def build_system_prompt(tool_descriptions: str, memory_context: str = "") -> str
     mem_section = ""
     if memory_context:
         mem_section = f"## 历史记忆\n\n以下是用户之前的操作记录，可以据此提供更贴心的服务：\n\n{memory_context}"
+
+    # 加载 Agent 自学习规则
+    learned_section = ""
+    try:
+        from tools.learned_rules import load_rules_for_prompt
+        learned_section = load_rules_for_prompt()
+    except Exception:
+        pass  # 加载失败不影响主功能
+
     return SYSTEM_PROMPT.format(
         tool_descriptions=tool_descriptions,
         memory_context=mem_section,
+        learned_rules_context=learned_section,
     )
 
 
