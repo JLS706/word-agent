@@ -12,7 +12,7 @@ Tool: 安全沙盒 Python 代码解释器
 import ast
 import io
 import sys
-import threading
+import multiprocessing
 import traceback
 from typing import Optional
 
@@ -228,7 +228,7 @@ def _make_safe_builtins() -> dict:
 
 
 # ─────────────────────────────────────────────
-# 沙盒执行引擎（第 3 层防护：超时）
+# 沙盒执行引擎（第 3 层防护：进程隔离 + 超时强杀）
 # ─────────────────────────────────────────────
 
 def _execute_in_sandbox(code: str, safe_builtins: dict) -> dict:
@@ -289,47 +289,80 @@ def _execute_in_sandbox(code: str, safe_builtins: dict) -> dict:
     return result
 
 
+def _sandbox_worker(code: str, result_queue: multiprocessing.Queue):
+    """
+    子进程入口函数：在完全独立的进程中执行沙盒代码。
+
+    为什么必须是模块级函数？
+    Windows 的 multiprocessing 使用 spawn 模式（而非 fork），
+    子进程需要重新 import 模块，因此 target 函数必须是可 import 的
+    模块级函数，不能是闭包或 lambda。
+
+    safe_builtins 在子进程内部重新构建（不通过参数传递），
+    因为 safe_open/safe_import 等函数对象无法跨进程 pickle 序列化。
+    """
+    try:
+        safe_builtins = _make_safe_builtins()
+        result = _execute_in_sandbox(code, safe_builtins)
+        result_queue.put(result)
+    except Exception as e:
+        result_queue.put({"stdout": "", "result": "", "error": str(e)})
+
+
 def execute_sandboxed(code: str, timeout: int = EXECUTION_TIMEOUT) -> str:
     """
-    带超时保护的沙盒执行。
+    带进程隔离和超时强杀的沙盒执行。
+
+    相比旧版 threading 方案的优势：
+    - threading.Thread: 共享内存，受 GIL 限制，超时后线程仍在后台运行
+    - multiprocessing.Process: 独立内存空间，可 terminate/kill 真正杀死
 
     Returns:
         执行结果的文本描述
     """
-    # 第 1 层：AST 安全检查
+    # 第 1 层：AST 安全检查（在主进程中完成，零成本）
     safety_error = check_code_safety(code)
     if safety_error:
         return safety_error
 
-    # 第 2 层：构建受限环境
-    safe_builtins = _make_safe_builtins()
+    # 第 2 + 3 层：在独立子进程中执行（进程隔离 + 超时强杀）
+    result_queue = multiprocessing.Queue()
+    proc = multiprocessing.Process(
+        target=_sandbox_worker,
+        args=(code, result_queue),
+        daemon=True,
+    )
+    proc.start()
+    proc.join(timeout=timeout)
 
-    # 第 3 层：超时保护
-    result_container = [None]
-    error_container = [None]
+    # ── 超时处理：两级强杀 ──
+    if proc.is_alive():
+        # 第一级：SIGTERM（优雅终止）
+        proc.terminate()
+        proc.join(timeout=2)
 
-    def target():
-        try:
-            result_container[0] = _execute_in_sandbox(code, safe_builtins)
-        except Exception as e:
-            error_container[0] = str(e)
+        if proc.is_alive():
+            # 第二级：SIGKILL（强制杀死，Windows 下等同 TerminateProcess）
+            proc.kill()
+            proc.join(timeout=1)
 
-    thread = threading.Thread(target=target, daemon=True)
-    thread.start()
-    thread.join(timeout=timeout)
-
-    if thread.is_alive():
         return (
-            f"⏰ 代码执行超时（超过 {timeout} 秒）！\n"
+            f"⏰ 代码执行超时（超过 {timeout} 秒），已强制终止子进程！\n"
             f"可能原因: 死循环或计算量过大。请优化代码后重试。"
         )
 
-    if error_container[0]:
-        return f"❌ 执行异常: {error_container[0]}"
+    # ── 子进程异常退出 ──
+    if proc.exitcode is not None and proc.exitcode != 0 and result_queue.empty():
+        return f"❌ 沙盒子进程异常退出 (exit code: {proc.exitcode})"
 
-    result = result_container[0]
-    if result is None:
-        return "❌ 执行异常: 未获取到结果"
+    # ── 获取执行结果 ──
+    if result_queue.empty():
+        return "❌ 执行异常: 子进程未返回结果"
+
+    try:
+        result = result_queue.get_nowait()
+    except Exception:
+        return "❌ 执行异常: 无法读取子进程结果"
 
     # 组装输出
     output_parts = []
