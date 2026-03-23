@@ -72,12 +72,14 @@ def _create_agent(config: dict) -> tuple[Agent, ToolRegistry]:
     from tools.learned_rules import (
         SaveLearnedRuleTool, ForgetLearnedRuleTool, ListLearnedRulesTool
     )
+    from tools.rag import IndexDocumentTool, SearchDocumentTool
 
     all_tools = [
         RefFormatterTool, RefCrossRefTool, FigCrossRefTool,
         FigCaptionTool, AcronymCheckerTool, LatexConverterTool,
         CodeInterpreterTool, SaveLearnedRuleTool,
         ForgetLearnedRuleTool, ListLearnedRulesTool,
+        IndexDocumentTool, SearchDocumentTool,
     ]
     for tool_cls in all_tools:
         registry.register(tool_cls())

@@ -4,3 +4,5 @@ toml>=0.10.0
 pywin32>=306           # Windows only（Docker 中不安装）
 fastapi>=0.100.0
 uvicorn>=0.20.0
+numpy>=1.24.0
+python-docx>=1.0.0

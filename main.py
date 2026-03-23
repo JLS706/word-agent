@@ -73,6 +73,7 @@ def create_agent(config: dict, dry_run: bool = False):
     from tools.learned_rules import (
         SaveLearnedRuleTool, ForgetLearnedRuleTool, ListLearnedRulesTool
     )
+    from tools.rag import IndexDocumentTool, SearchDocumentTool
 
     # 初始化 LLM
     llm_config = config.get("llm", {})
@@ -98,6 +99,8 @@ def create_agent(config: dict, dry_run: bool = False):
     registry.register(SaveLearnedRuleTool())         # 自学习：保存规则
     registry.register(ForgetLearnedRuleTool())       # 自学习：删除规则
     registry.register(ListLearnedRulesTool())        # 自学习：列出规则
+    registry.register(IndexDocumentTool())           # RAG：文档索引
+    registry.register(SearchDocumentTool())          # RAG：语义搜索
 
     # 创建 Executor Agent
     agent_config = config.get("agent", {})
