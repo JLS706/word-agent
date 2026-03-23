@@ -1,0 +1,5 @@
+# Docker 环境依赖（排除 Windows 专属的 pywin32）
+openai>=1.0.0
+toml>=0.10.0
+fastapi>=0.100.0
+uvicorn>=0.20.0

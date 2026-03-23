@@ -126,15 +126,45 @@ Phase 2 — Executor (逐步执行 + 回溯):
 Phase 3 — Reviewer: 读取处理后文档 → 验证并输出报告
 ```
 
-### 安全沙盒（三层防护）
+### 安全沙盒（三层防护 + Docker 隔离）
 
 ```
 Agent 生成的代码 → Layer 1: AST 静态分析（拦截危险模式）
                 → Layer 2: builtins 白名单（运行时纵深防御）
                 → Layer 3: 子进程隔离 + 超时强杀（资源兜底）
+                → Layer 4: Docker 容器隔离（OS 级沙盒）
+```
+
+## 🐳 Docker 部署
+
+### 单容器运行
+
+```bash
+docker build -t docmaster-agent .
+docker run -d -p 8000:8000 -v ./config:/app/config docmaster-agent
+```
+
+### 微服务架构（Docker Compose）
+
+```bash
+docker compose up -d    # 一键启动 Agent + Sandbox 两个容器
+docker compose down     # 停止并清理
+```
+
+```
+┌─── Docker 内部网络 ───────────────────┐
+│                                       │
+│  agent (8000 对外)                    │
+│    ├── FastAPI + ReAct Agent          │
+│    └── 调用 sandbox 执行代码           │
+│           ↕ 内部通信                   │
+│  sandbox (8001 仅内部)                │
+│    ├── 独立沙盒微服务                  │
+│    └── 资源限制: 1 CPU / 256MB        │
+│                                       │
+└───────────────────────────────────────┘
 ```
 
 ## 📄 License
 
 MIT
-

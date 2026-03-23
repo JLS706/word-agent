@@ -1,4 +1,6 @@
 # DocMaster Agent 依赖
 openai>=1.0.0
 toml>=0.10.0
-pywin32>=306
+pywin32>=306           # Windows only（Docker 中不安装）
+fastapi>=0.100.0
+uvicorn>=0.20.0
