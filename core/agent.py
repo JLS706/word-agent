@@ -34,6 +34,7 @@ class Agent:
         verbose: bool = True,
         dry_run: bool = False,
         memory=None,
+        skill_manager=None,
     ):
         self.llm = llm
         self.tools = tool_registry
@@ -41,20 +42,29 @@ class Agent:
         self.verbose = verbose
         self.dry_run = dry_run
         self.memory = memory
+        self.skill_manager = skill_manager
         self.state = AgentState.IDLE
         self.history: list[Message] = []
         self._session_tools: list[str] = []   # 本轮执行过的工具名
         self._session_file: str = ""           # 本轮操作的文件路径
         self._retry_counts: dict[str, int] = {}  # 工具重试计数器
 
-        # 构建系统提示词（含记忆上下文）
+        # 构建基础系统提示词（无技能上下文，启动时用）
+        self._build_system_prompt()
+
+    def _build_system_prompt(self, skills_context: str = ""):
+        """构建并设置系统提示词"""
         tool_desc = self.tools.describe()
-        memory_context = memory.get_context_summary() if memory else ""
+        memory_context = self.memory.get_context_summary() if self.memory else ""
         system_msg = Message(
             role=Role.SYSTEM,
-            content=build_system_prompt(tool_desc, memory_context),
+            content=build_system_prompt(tool_desc, memory_context, skills_context),
         )
-        self.history.append(system_msg)
+        # 替换或添加系统消息
+        if self.history and self.history[0].role == Role.SYSTEM:
+            self.history[0] = system_msg
+        else:
+            self.history.insert(0, system_msg)
 
     def run(self, user_input: str) -> str:
         """
@@ -66,6 +76,15 @@ class Agent:
         Returns:
             Agent 的最终回答文本
         """
+        # 根据用户输入匹配 Skills，动态重建系统提示词
+        if self.skill_manager:
+            matched = self.skill_manager.match(user_input)
+            skills_ctx = self.skill_manager.build_skills_context(matched)
+            self._build_system_prompt(skills_ctx)
+            if self.verbose and matched:
+                names = [s.name for s in matched]
+                print(f"📚 已加载技能: {', '.join(names)}")
+
         # 添加用户消息
         self.history.append(Message(role=Role.USER, content=user_input))
         self.state = AgentState.THINKING

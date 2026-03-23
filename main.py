@@ -102,6 +102,23 @@ def create_agent(config: dict, dry_run: bool = False):
     registry.register(IndexDocumentTool())           # RAG：文档索引
     registry.register(SearchDocumentTool())          # RAG：语义搜索
 
+    # 初始化 Skills 管理器
+    from core.skills import SkillManager
+    skills_dir = os.path.join(PROJECT_ROOT, "skills")
+    # 尝试创建 Embedding 客户端用于语义匹配
+    try:
+        from core.embeddings import EmbeddingClient
+        embed_client = EmbeddingClient(
+            api_key=llm_config.get("api_key", ""),
+            base_url=llm_config.get("base_url", ""),
+            model=llm_config.get("embedding_model", "text-embedding-3-small"),
+        )
+    except Exception:
+        embed_client = None
+    skill_manager = SkillManager(skills_dir, embed_client=embed_client)
+    print(f"已加载 {len(skill_manager.skills)} 个技能: "
+          f"{[s.name for s in skill_manager.skills]}")
+
     # 创建 Executor Agent
     agent_config = config.get("agent", {})
     agent = Agent(
@@ -111,6 +128,7 @@ def create_agent(config: dict, dry_run: bool = False):
         verbose=agent_config.get("verbose", True),
         dry_run=dry_run,
         memory=memory,
+        skill_manager=skill_manager,
     )
 
     # 创建 Multi-Agent 编排器
