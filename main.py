@@ -138,6 +138,7 @@ def create_agent(config: dict, dry_run: bool = False):
         tool_registry=registry,
         memory=memory,
         verbose=agent_config.get("verbose", True),
+        checkpoint_dir=os.path.join(PROJECT_ROOT, "checkpoints"),
     )
 
     return agent, orchestrator

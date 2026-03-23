@@ -5,12 +5,15 @@ Planner → Executor → Reviewer 三角色流水线。
 三个角色共享同一个 LLM，通过不同 System Prompt 切换身份。
 """
 
+import os
 import re
+import hashlib
 import traceback
 
 from core.llm import LLM
 from core.schema import Message, Role
 from core.prompt import build_planner_prompt, build_reviewer_prompt
+from core.checkpoint import Checkpointer, WorkflowState, WorkflowPhase
 
 
 class MultiAgentOrchestrator:
@@ -25,79 +28,87 @@ class MultiAgentOrchestrator:
     三个角色共享同一 LLM 和 ToolRegistry，通过 System Prompt 切换。
     """
 
-    def __init__(self, llm: LLM, executor_agent, tool_registry, memory=None, verbose=True):
-        """
-        Args:
-            llm: 共享的 LLM 实例
-            executor_agent: 已创建的 Executor Agent 实例
-            tool_registry: 工具注册表
-            memory: 记忆系统
-            verbose: 是否打印详细日志
-        """
+    def __init__(self, llm: LLM, executor_agent, tool_registry, memory=None,
+                 verbose=True, checkpoint_dir: str = ""):
         self.llm = llm
         self.executor = executor_agent
         self.tools = tool_registry
         self.memory = memory
         self.verbose = verbose
+        self.checkpointer = Checkpointer(checkpoint_dir) if checkpoint_dir else None
+
+    @staticmethod
+    def _make_task_id(file_path: str) -> str:
+        return hashlib.md5(os.path.abspath(file_path).encode()).hexdigest()[:12]
 
     def run_pipeline(self, file_path: str) -> str:
-        """
-        运行完整的 Multi-Agent 流水线。
+        """Run pipeline with checkpoint save/resume support."""
+        task_id = self._make_task_id(file_path)
 
-        Args:
-            file_path: 要处理的 Word 文档路径
+        # Try to resume from checkpoint
+        state = None
+        if self.checkpointer:
+            state = self.checkpointer.load(task_id)
+            if state and state.phase != WorkflowPhase.NOT_STARTED:
+                if self.verbose:
+                    print(f"\n  [Checkpoint] Resume from {state.phase.value}")
+        if not state:
+            state = WorkflowState(file_path)
 
-        Returns:
-            最终的综合报告
-        """
-        report_parts = []
+        # Phase 1: Planner
+        if state.phase in (WorkflowPhase.NOT_STARTED, WorkflowPhase.PLANNING):
+            if self.verbose:
+                print("\n" + "=" * 60)
+                print("  Phase 1/3 - Planner")
+                print("=" * 60)
+            state.phase = WorkflowPhase.PLANNING
+            plan = self._run_planner(file_path)
+            state.plan = plan
+            state.report_parts.append("## Planning\n" + plan)
+            state.phase = WorkflowPhase.PLAN_DONE
+            if self.checkpointer:
+                self.checkpointer.save(task_id, state)
 
-        # ═══════════ Phase 1: Planner ═══════════
-        if self.verbose:
-            print("\n" + "═" * 60)
-            print("  🧭 Phase 1/3 — Planner（规划者）正在分析文档...")
-            print("═" * 60)
+        # Phase 2: Executor
+        if state.phase in (WorkflowPhase.PLAN_DONE, WorkflowPhase.EXECUTING):
+            if self.verbose:
+                print("\n" + "=" * 60)
+                print("  Phase 2/3 - Executor")
+                print("=" * 60)
+            state.phase = WorkflowPhase.EXECUTING
+            exec_result = self._run_executor_with_backtracking(
+                file_path, state.plan, state=state, task_id=task_id
+            )
+            state.report_parts.append("## Execution\n" + exec_result)
+            state.phase = WorkflowPhase.EXEC_DONE
+            if self.checkpointer:
+                self.checkpointer.save(task_id, state)
 
-        plan = self._run_planner(file_path)
-        report_parts.append("## 📋 规划阶段\n" + plan)
+        # Phase 3: Reviewer
+        if state.phase in (WorkflowPhase.EXEC_DONE, WorkflowPhase.REVIEWING):
+            if self.verbose:
+                print("\n" + "=" * 60)
+                print("  Phase 3/3 - Reviewer")
+                print("=" * 60)
+            state.phase = WorkflowPhase.REVIEWING
+            exec_text = ""
+            for part in state.report_parts:
+                if part.startswith("## Execution"):
+                    exec_text = part
+            review = self._run_reviewer(file_path, exec_text)
+            state.report_parts.append("## Review\n" + review)
+            state.phase = WorkflowPhase.COMPLETED
 
-        if self.verbose:
-            print(f"\n📋 执行计划:\n{plan}")
-
-        # ═══════════ Phase 2: Executor ═══════════
-        if self.verbose:
-            print("\n" + "═" * 60)
-            print("  ⚡ Phase 2/3 — Executor（执行者）正在执行计划...")
-            print("═" * 60)
-
-        exec_result = self._run_executor_with_backtracking(file_path, plan)
-        report_parts.append("## 🔧 执行阶段\n" + exec_result)
-
-        # ═══════════ Phase 3: Reviewer ═══════════
-        if self.verbose:
-            print("\n" + "═" * 60)
-            print("  🔍 Phase 3/3 — Reviewer（审查者）正在验证结果...")
-            print("═" * 60)
-
-        review = self._run_reviewer(file_path, exec_result)
-        report_parts.append("## ✅ 验证阶段\n" + review)
-
-        # ═══════════ 综合报告 ═══════════
-        final_report = "\n\n".join(report_parts)
-
-        if self.verbose:
-            print("\n" + "═" * 60)
-            print("  📊 Multi-Agent 流水线完成！")
-            print("═" * 60)
-            print(final_report)
-
-        # 保存到记忆
+        # Final report
+        final_report = "\n\n".join(state.report_parts)
         if self.memory:
             self.memory.add_session(
                 file_path=file_path,
                 actions=["pipeline:planner", "pipeline:executor", "pipeline:reviewer"],
-                summary=f"Multi-Agent流水线处理完成",
+                summary="Pipeline done",
             )
+        if self.checkpointer:
+            self.checkpointer.clear(task_id)
 
         return final_report
 
@@ -374,6 +385,8 @@ class MultiAgentOrchestrator:
         file_path: str,
         plan: str,
         max_retries: int = 2,
+        state: WorkflowState = None,
+        task_id: str = "",
     ) -> str:
         """
         逻步执行 + 每步验证 + 三级回溯。
@@ -400,12 +413,21 @@ class MultiAgentOrchestrator:
         # 重置 Executor
         self.executor.reset()
 
-        completed_steps: list[str] = []
-        step_results: list[str] = []
-
-        i = 0
-        retry_counts: dict[int, int] = {}  # step_index -> retry_count
-        re_planned = False  # 是否已经重新规划过
+        # Resume from checkpoint
+        if state and state.current_step_index > 0:
+            completed_steps = state.completed_steps
+            step_results = state.step_results
+            i = state.current_step_index
+            retry_counts = {int(k): v for k, v in state.retry_counts.items()}
+            re_planned = state.re_planned
+            if self.verbose:
+                print(f"  [Checkpoint] Resume from step {i + 1}")
+        else:
+            completed_steps: list[str] = []
+            step_results: list[str] = []
+            i = 0
+            retry_counts: dict[int, int] = {}
+            re_planned = False
 
         while i < len(steps):
             step = steps[i]
@@ -434,10 +456,17 @@ class MultiAgentOrchestrator:
                 print(f"  {status} — {reason}")
 
             if passed:
-                # 成功 → 记录并继续下一步
                 completed_steps.append(step_desc)
-                step_results.append(f"✅ Step {step['index']}: {step_desc}\n{result}")
+                step_results.append(f"Step {step['index']}: {step_desc}\n{result}")
                 i += 1
+                # Checkpoint after each successful step
+                if state and self.checkpointer and task_id:
+                    state.completed_steps = completed_steps
+                    state.step_results = step_results
+                    state.current_step_index = i
+                    state.retry_counts = {str(k): v for k, v in retry_counts.items()}
+                    state.re_planned = re_planned
+                    self.checkpointer.save(task_id, state)
                 continue
 
             # ── 失败：回溯策略 ──
