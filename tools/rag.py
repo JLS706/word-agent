@@ -12,7 +12,7 @@ DocMaster Agent - RAG 工具（检索增强生成）
 
 import os
 import re
-from tools.base import BaseTool
+from tools.base import Tool as BaseTool
 
 
 # 全局向量存储（同一个文档在会话中复用）
@@ -35,7 +35,7 @@ def _get_embed_client():
         _current_embed_client = EmbeddingClient(
             api_key=llm_config.get("api_key", ""),
             base_url=llm_config.get("base_url", "https://generativelanguage.googleapis.com/v1beta/openai/"),
-            model=llm_config.get("embedding_model", "text-embedding-3-small"),
+            model=llm_config.get("embedding_model", "gemini-embedding-001"),
         )
     return _current_embed_client
 
@@ -149,7 +149,7 @@ class IndexDocumentTool(BaseTool):
         "required": ["file_path"],
     }
 
-    def run(self, file_path: str, **kwargs) -> str:
+    def execute(self, file_path: str, **kwargs) -> str:
         global _current_store
 
         if not os.path.exists(file_path):
@@ -240,7 +240,7 @@ class SearchDocumentTool(BaseTool):
         "required": ["query"],
     }
 
-    def run(self, query: str, top_k: int = 3, **kwargs) -> str:
+    def execute(self, query: str, top_k: int = 3, **kwargs) -> str:
         if _current_store is None or len(_current_store) == 0:
             return "尚未索引任何文档，请先使用 index_document 工具索引文档。"
 

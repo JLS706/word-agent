@@ -74,6 +74,11 @@ def create_agent(config: dict, dry_run: bool = False):
         SaveLearnedRuleTool, ForgetLearnedRuleTool, ListLearnedRulesTool
     )
     from tools.rag import IndexDocumentTool, SearchDocumentTool
+    from tools.word_cleanup import CloseWordTool
+    from tools.tool_creator import (
+        CreateToolTool, ApproveToolTool, ListCustomToolsTool,
+        load_custom_tools,
+    )
 
     # 初始化 LLM
     llm_config = config.get("llm", {})
@@ -101,6 +106,15 @@ def create_agent(config: dict, dry_run: bool = False):
     registry.register(ListLearnedRulesTool())        # 自学习：列出规则
     registry.register(IndexDocumentTool())           # RAG：文档索引
     registry.register(SearchDocumentTool())          # RAG：语义搜索
+    registry.register(CloseWordTool())                # Word 进程清理
+    registry.register(CreateToolTool())               # 动态工具创建
+    registry.register(ApproveToolTool(registry))      # 工具审批激活
+    registry.register(ListCustomToolsTool())          # 列出自定义工具
+
+    # 自动加载已审批的自定义工具
+    custom_count = load_custom_tools(registry)
+    if custom_count > 0:
+        print(f"📦 已加载 {custom_count} 个自定义工具")
 
     # 初始化 Skills 管理器
     from core.skills import SkillManager
@@ -111,7 +125,7 @@ def create_agent(config: dict, dry_run: bool = False):
         embed_client = EmbeddingClient(
             api_key=llm_config.get("api_key", ""),
             base_url=llm_config.get("base_url", ""),
-            model=llm_config.get("embedding_model", "text-embedding-3-small"),
+            model=llm_config.get("embedding_model", "gemini-embedding-001"),
         )
     except Exception:
         embed_client = None

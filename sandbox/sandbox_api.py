@@ -1,24 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-DocMaster - Sandbox Service (独立沙盒微服务)
+DocMaster - Sandbox Service (沙盒微服务)
 
-这是一个独立的 FastAPI 服务，只做一件事：接收 Python 代码，在沙盒中执行，返回结果。
-它将被打包成独立的 Docker 容器，与 Agent 容器隔离运行。
+这是一个独立的 FastAPI 服务，为 Agent 提供安全的代码执行环境。
+沙盒引擎统一使用 core/sandbox.py，本文件只是 HTTP 包装层。
 
-为什么要独立？
-  - 代码炸了只影响这个容器，Agent 容器不受影响
-  - 可以给这个容器单独设资源限制（CPU/内存上限）
-  - 需要扩容时，只复制这个容器就行
+端点：
+  POST /execute    — 严格模式（只读分析）
+  POST /test-tool  — 工具模式（允许 os/subprocess，测试自定义工具代码）
+  GET  /health     — 健康检查
 """
-
-import ast
-import sys
-import io
-import multiprocessing
-from contextlib import redirect_stdout
 
 from fastapi import FastAPI
 from pydantic import BaseModel
+
+from core.sandbox import execute_sandboxed, test_tool_sandboxed
 
 
 # ─────────────────────────────────────────────
@@ -27,19 +23,19 @@ from pydantic import BaseModel
 
 app = FastAPI(
     title="DocMaster Sandbox Service",
-    description="安全代码执行沙盒微服务",
-    version="1.0.0",
+    description="安全代码执行沙盒微服务（引擎: core/sandbox.py）",
+    version="2.0.0",
 )
 
 
 # ─────────────────────────────────────────────
-# 请求/响应模型
+# 请求 / 响应模型
 # ─────────────────────────────────────────────
 
 class ExecuteRequest(BaseModel):
     """代码执行请求"""
     code: str
-    timeout: int = 5  # 超时秒数，默认5秒
+    timeout: int = 5
 
 class ExecuteResponse(BaseModel):
     """代码执行结果"""
@@ -47,95 +43,17 @@ class ExecuteResponse(BaseModel):
     output: str
     error: str = ""
 
+class TestToolRequest(BaseModel):
+    """工具代码测试请求"""
+    code: str
+    timeout: int = 10
 
-# ─────────────────────────────────────────────
-# 沙盒核心（从 code_interpreter.py 提取的精简版）
-# ─────────────────────────────────────────────
-
-# AST 安全检查白名单
-SAFE_MODULES = {"math", "re", "json", "random", "datetime", "collections", "itertools", "functools", "string"}
-DANGEROUS_CALLS = {"exec", "eval", "compile", "__import__", "globals", "locals", "getattr", "setattr", "delattr"}
-
-def _check_ast_safety(code: str) -> str | None:
-    """Layer 1: AST 静态分析 — 在执行前扫描危险模式"""
-    try:
-        tree = ast.parse(code)
-    except SyntaxError as e:
-        return f"SyntaxError: {e}"
-
-    for node in ast.walk(tree):
-        # 检查危险 import
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name.split(".")[0] not in SAFE_MODULES:
-                    return f"import {alias.name} is not allowed"
-        elif isinstance(node, ast.ImportFrom):
-            if node.module and node.module.split(".")[0] not in SAFE_MODULES:
-                return f"from {node.module} import ... is not allowed"
-        # 检查危险函数调用
-        elif isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Name) and node.func.id in DANGEROUS_CALLS:
-                return f"{node.func.id}() is not allowed"
-    return None
-
-
-def _sandbox_worker(code: str, result_queue):
-    """子进程入口：在受限环境中执行代码"""
-    import builtins as _builtins
-
-    # Layer 2: 构造安全 builtins
-    safe_names = [
-        "print", "len", "range", "int", "float", "str", "list", "dict",
-        "tuple", "set", "bool", "abs", "max", "min", "sum", "sorted",
-        "enumerate", "zip", "map", "filter", "isinstance", "type",
-        "round", "reversed", "any", "all", "chr", "ord", "hex",
-    ]
-    safe_builtins = {name: getattr(_builtins, name) for name in safe_names if hasattr(_builtins, name)}
-    safe_builtins["__build_class__"] = _builtins.__build_class__
-
-    restricted_globals = {
-        "__builtins__": safe_builtins,
-        "__name__": "__sandbox__",
-    }
-
-    # 预加载安全模块
-    import math, re
-    restricted_globals["math"] = math
-    restricted_globals["re"] = re
-
-    # 捕获 stdout
-    buf = io.StringIO()
-    try:
-        with redirect_stdout(buf):
-            exec(compile(code, "<sandbox>", "exec"), restricted_globals)
-        result_queue.put({"output": buf.getvalue(), "error": ""})
-    except Exception as e:
-        result_queue.put({"output": buf.getvalue(), "error": f"{type(e).__name__}: {e}"})
-
-
-def execute_in_sandbox(code: str, timeout: int = 5) -> dict:
-    """完整的三层沙盒执行"""
-    # Layer 1: AST 检查
-    error = _check_ast_safety(code)
-    if error:
-        return {"output": "", "error": f"[AST] {error}"}
-
-    # Layer 2+3: 子进程执行
-    queue = multiprocessing.Queue()
-    proc = multiprocessing.Process(target=_sandbox_worker, args=(code, queue), daemon=True)
-    proc.start()
-    proc.join(timeout=timeout)
-
-    if proc.is_alive():
-        proc.terminate()
-        proc.join(timeout=2)
-        if proc.is_alive():
-            proc.kill()
-        return {"output": "", "error": f"[TIMEOUT] code execution exceeded {timeout}s limit"}
-
-    if not queue.empty():
-        return queue.get_nowait()
-    return {"output": "", "error": "[ERROR] no result from sandbox"}
+class TestToolResponse(BaseModel):
+    """工具代码测试结果"""
+    success: bool
+    output: str
+    error: str = ""
+    test_output: str = ""
 
 
 # ─────────────────────────────────────────────
@@ -145,23 +63,43 @@ def execute_in_sandbox(code: str, timeout: int = 5) -> dict:
 @app.get("/health")
 def health_check():
     """健康检查"""
-    return {"status": "healthy", "service": "sandbox"}
+    return {"status": "healthy", "service": "sandbox", "version": "2.0.0"}
 
 
 @app.post("/execute", response_model=ExecuteResponse)
 def execute_code(req: ExecuteRequest):
     """
-    执行 Python 代码。
+    严格模式：执行只读 Python 代码（白名单: re, math, json 等）。
 
     示例:
         POST /execute
         {"code": "print(1 + 1)", "timeout": 5}
     """
-    result = execute_in_sandbox(req.code, req.timeout)
+    result = execute_sandboxed(req.code, timeout=req.timeout)
+    # execute_sandboxed 返回的是格式化的字符串
+    has_error = result.startswith("❌") or result.startswith("代码安全检查未通过")
     return ExecuteResponse(
-        success=not bool(result["error"]),
-        output=result["output"],
-        error=result["error"],
+        success=not has_error,
+        output=result if not has_error else "",
+        error=result if has_error else "",
+    )
+
+
+@app.post("/test-tool", response_model=TestToolResponse)
+def test_tool_code(req: TestToolRequest):
+    """
+    工具模式：测试自定义工具代码（白名单更宽，允许 os/subprocess 等）。
+
+    示例:
+        POST /test-tool
+        {"code": "from tools.base import Tool\\nclass CustomTool(Tool): ...", "timeout": 10}
+    """
+    result = test_tool_sandboxed(req.code, timeout=req.timeout)
+    return TestToolResponse(
+        success=result.get("success", False),
+        output=result.get("stdout", ""),
+        error=result.get("error", ""),
+        test_output=result.get("test_output", ""),
     )
 
 
@@ -172,7 +110,9 @@ def execute_code(req: ExecuteRequest):
 if __name__ == "__main__":
     import uvicorn
     print("=" * 40)
-    print("  Sandbox Service")
+    print("  Sandbox Service v2.0")
     print("  http://localhost:8001")
+    print("  Engine: core/sandbox.py")
+    print("  Endpoints: /execute, /test-tool")
     print("=" * 40)
     uvicorn.run(app, host="0.0.0.0", port=8001)

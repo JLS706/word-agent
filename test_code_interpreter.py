@@ -3,7 +3,7 @@
 import sys, os, io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from tools.code_interpreter import execute_sandboxed
+from core.sandbox import execute_sandboxed
 
 
 def run_tests():

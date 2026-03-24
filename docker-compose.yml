@@ -26,7 +26,9 @@ services:
 
   # ── 服务 2: Sandbox（沙盒微服务）──
   sandbox:
-    build: ./sandbox                   # 用 sandbox/ 目录的 Dockerfile 构建
+    build:
+      context: .                         # 使用项目根目录作为构建上下文
+      dockerfile: sandbox/Dockerfile     # 指定 Dockerfile 路径
     # 不映射端口到宿主机！只有 Agent 能访问，外部访问不了
     # 这就是安全隔离：用户 → Agent → Sandbox，用户不能直接调沙盒
     deploy:

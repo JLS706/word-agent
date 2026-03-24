@@ -26,7 +26,7 @@ class EmbeddingClient:
     语义相近的文本在向量空间中距离更近。
     """
 
-    def __init__(self, api_key: str, base_url: str, model: str = "text-embedding-3-small"):
+    def __init__(self, api_key: str, base_url: str, model: str = "gemini-embedding-001"):
         from openai import OpenAI
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.model = model
@@ -55,7 +55,7 @@ class EmbeddingClient:
                 model=self.model,
             )
             # 按 index 排序确保顺序正确
-            sorted_data = sorted(resp.data, key=lambda x: x.index)
+            sorted_data = sorted(resp.data, key=lambda x: x.index if x.index is not None else -1)
             all_embeddings.extend([d.embedding for d in sorted_data])
         return all_embeddings
 

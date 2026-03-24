@@ -146,7 +146,7 @@ class SkillManager:
     # 匹配逻辑
     # ─────────────────────────────────────────
 
-    def match(self, user_input: str, threshold: float = 0.35) -> list[Skill]:
+    def match(self, user_input: str, threshold: float = 0.5, max_results: int = 2) -> list[Skill]:
         """
         根据用户输入匹配相关 Skills。
         
@@ -168,7 +168,7 @@ class SkillManager:
 
         # Layer 2: Embedding 语义匹配
         if self.embed_client:
-            return self._match_by_embedding(user_input, threshold)
+            return self._match_by_embedding(user_input, threshold, max_results)
 
         return []
 
@@ -189,7 +189,7 @@ class SkillManager:
         matched.sort(key=lambda x: (x[1] * x[0].priority), reverse=True)
         return [s for s, _ in matched]
 
-    def _match_by_embedding(self, user_input: str, threshold: float) -> list[Skill]:
+    def _match_by_embedding(self, user_input: str, threshold: float, max_results: int = 2) -> list[Skill]:
         """Layer 2: Embedding 语义匹配（1 次 API 调用）"""
         # 确保 Skill Embeddings 已预计算
         self._ensure_embeddings()
@@ -211,7 +211,7 @@ class SkillManager:
                         scored.append((skill, score))
 
             scored.sort(key=lambda x: x[1], reverse=True)
-            return [s for s, _ in scored]
+            return [s for s, _ in scored[:max_results]]
         except Exception:
             return []
 
