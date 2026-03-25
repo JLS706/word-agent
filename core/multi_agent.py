@@ -7,6 +7,7 @@ Planner → Executor → Reviewer 三角色流水线。
 
 import os
 import re
+import shutil
 import hashlib
 import traceback
 
@@ -42,6 +43,60 @@ class MultiAgentOrchestrator:
     def _make_task_id(file_path: str) -> str:
         return hashlib.md5(os.path.abspath(file_path).encode()).hexdigest()[:12]
 
+    # ─────────────────────────────────────────────
+    # 文档事务（备份 → 执行 → 回滚）
+    # ─────────────────────────────────────────────
+
+    @staticmethod
+    def _backup_document(file_path: str) -> str:
+        """Pipeline 开始时创建文档备份（全量快照）。"""
+        abs_path = os.path.abspath(file_path)
+        backup_path = abs_path + ".bak"
+        if os.path.exists(abs_path):
+            shutil.copy2(abs_path, backup_path)
+            logger.info("📋 已备份文档: %s", backup_path)
+        return backup_path
+
+    @staticmethod
+    def _discard_word_changes(file_path: str):
+        """
+        丢弃 Word 内存中的脏修改（不保存关闭）。
+
+        两级回退：
+          1. doc.Close(SaveChanges=0) — 礼貌关闭
+          2. taskkill /f — Word 进程也挂了就暴力杀
+        """
+        abs_path = os.path.abspath(file_path).lower()
+        try:
+            import win32com.client
+            word = win32com.client.GetObject(Class="Word.Application")
+            for doc in word.Documents:
+                if os.path.abspath(doc.FullName).lower() == abs_path:
+                    doc.Close(SaveChanges=0)  # wdDoNotSaveChanges
+                    logger.info("🔄 已丢弃文档脏修改（Close without save）")
+                    return
+        except Exception:
+            # COM 也挂了 → 强杀 Word 进程
+            try:
+                os.system("taskkill /f /im WINWORD.EXE >nul 2>&1")
+                logger.warning("🔄 Word 进程已强制终止")
+            except Exception:
+                pass
+
+    @staticmethod
+    def _restore_document(file_path: str, backup_path: str):
+        """从 .bak 全量恢复（用于人类审查否决或灾难性回退）。"""
+        if os.path.exists(backup_path):
+            shutil.copy2(backup_path, os.path.abspath(file_path))
+            logger.info("♻️ 已从备份恢复文档")
+
+    @staticmethod
+    def _cleanup_backup(backup_path: str):
+        """Pipeline 成功完成后删除备份。"""
+        if os.path.exists(backup_path):
+            os.remove(backup_path)
+            logger.debug("🗑️ 已清理备份文件")
+
     def run_pipeline(self, file_path: str) -> str:
         """Run pipeline with checkpoint save/resume support."""
         task_id = self._make_task_id(file_path)
@@ -55,6 +110,9 @@ class MultiAgentOrchestrator:
                     logger.info("\n  [Checkpoint] Resume from %s", state.phase.value)
         if not state:
             state = WorkflowState(file_path)
+
+        # ── 文档事务：Pipeline 开始时备份 ──
+        backup_path = self._backup_document(file_path)
 
         # Phase 1: Planner
         if state.phase in (WorkflowPhase.NOT_STARTED, WorkflowPhase.PLANNING):
@@ -102,6 +160,10 @@ class MultiAgentOrchestrator:
 
         # Final report
         final_report = "\n\n".join(state.report_parts)
+
+        # ── 文档事务：Pipeline 成功完成，清理备份 ──
+        self._cleanup_backup(backup_path)
+
         if self.memory:
             self.memory.add_session(
                 file_path=file_path,
@@ -470,7 +532,7 @@ class MultiAgentOrchestrator:
                     self.checkpointer.save(task_id, state)
                 continue
 
-            # ── 失败：回溯策略 ──
+            # ── 失败：丢弃 Word 脏修改 + 回溯策略 ──\r\n            self._discard_word_changes(file_path)
 
             # 关键性错误 → 直接跳过，汇报人类（不浪费重试和重规划）
             is_critical = reason.startswith("[CRITICAL]")
