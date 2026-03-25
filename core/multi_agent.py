@@ -11,6 +11,7 @@ import hashlib
 import traceback
 
 from core.llm import LLM
+from core.logger import logger
 from core.schema import Message, Role
 from core.prompt import build_planner_prompt, build_reviewer_prompt
 from core.checkpoint import Checkpointer, WorkflowState, WorkflowPhase
@@ -51,16 +52,16 @@ class MultiAgentOrchestrator:
             state = self.checkpointer.load(task_id)
             if state and state.phase != WorkflowPhase.NOT_STARTED:
                 if self.verbose:
-                    print(f"\n  [Checkpoint] Resume from {state.phase.value}")
+                    logger.info("\n  [Checkpoint] Resume from %s", state.phase.value)
         if not state:
             state = WorkflowState(file_path)
 
         # Phase 1: Planner
         if state.phase in (WorkflowPhase.NOT_STARTED, WorkflowPhase.PLANNING):
             if self.verbose:
-                print("\n" + "=" * 60)
-                print("  Phase 1/3 - Planner")
-                print("=" * 60)
+                logger.info("\n" + "=" * 60)
+                logger.info("  Phase 1/3 - Planner")
+                logger.info("=" * 60)
             state.phase = WorkflowPhase.PLANNING
             plan = self._run_planner(file_path)
             state.plan = plan
@@ -72,9 +73,9 @@ class MultiAgentOrchestrator:
         # Phase 2: Executor
         if state.phase in (WorkflowPhase.PLAN_DONE, WorkflowPhase.EXECUTING):
             if self.verbose:
-                print("\n" + "=" * 60)
-                print("  Phase 2/3 - Executor")
-                print("=" * 60)
+                logger.info("\n" + "=" * 60)
+                logger.info("  Phase 2/3 - Executor")
+                logger.info("=" * 60)
             state.phase = WorkflowPhase.EXECUTING
             exec_result = self._run_executor_with_backtracking(
                 file_path, state.plan, state=state, task_id=task_id
@@ -87,9 +88,9 @@ class MultiAgentOrchestrator:
         # Phase 3: Reviewer
         if state.phase in (WorkflowPhase.EXEC_DONE, WorkflowPhase.REVIEWING):
             if self.verbose:
-                print("\n" + "=" * 60)
-                print("  Phase 3/3 - Reviewer")
-                print("=" * 60)
+                logger.info("\n" + "=" * 60)
+                logger.info("  Phase 3/3 - Reviewer")
+                logger.info("=" * 60)
             state.phase = WorkflowPhase.REVIEWING
             exec_text = ""
             for part in state.report_parts:
@@ -149,7 +150,7 @@ class MultiAgentOrchestrator:
                             output = tool.execute(**tc.arguments)
                             if self.verbose:
                                 display = output[:200] + "..." if len(output) > 200 else output
-                                print(f"  🧭 Planner 调用: {tc.name} → {display}")
+                                logger.debug("  🧭 Planner 调用: %s → %s", tc.name, display)
                         except Exception as e:
                             output = f"工具执行失败: {e}"
                     else:
@@ -290,7 +291,7 @@ class MultiAgentOrchestrator:
 
         # ── Tier 2: LLM mini-review（只在 Tier 1 无法判断时触发）──
         if self.verbose:
-            print(f"    🔍 Tier1 无法确定，触发 Tier2 LLM mini-review...")
+            logger.debug("    🔍 Tier1 无法确定，触发 Tier2 LLM mini-review...")
 
         try:
             review_messages = [
@@ -400,14 +401,14 @@ class MultiAgentOrchestrator:
         steps = self._parse_plan_steps(plan)
 
         if self.verbose:
-            print(f"\n  📋 解析出 {len(steps)} 个执行步骤:")
+            logger.info("\n  📋 解析出 %d 个执行步骤:", len(steps))
             for s in steps:
-                print(f"    {s['index']}. {s['tool']} — {s['desc']}")
+                logger.info("    %d. %s — %s", s['index'], s['tool'], s['desc'])
 
         # 如果解析失败（回退为单步），直接用旧版执行器
         if len(steps) == 1 and steps[0]["tool"] == "full_plan":
             if self.verbose:
-                print("  ⚠️ 计划格式无法解析，回退为整体执行模式")
+                logger.warning("❗ 计划格式无法解析，回退为整体执行模式")
             return self._run_executor(file_path, plan)
 
         # 重置 Executor
@@ -421,7 +422,7 @@ class MultiAgentOrchestrator:
             retry_counts = {int(k): v for k, v in state.retry_counts.items()}
             re_planned = state.re_planned
             if self.verbose:
-                print(f"  [Checkpoint] Resume from step {i + 1}")
+                logger.info("  [Checkpoint] Resume from step %d", i + 1)
         else:
             completed_steps: list[str] = []
             step_results: list[str] = []
@@ -435,7 +436,7 @@ class MultiAgentOrchestrator:
             step_desc = f"{step['tool']} ({step['desc']})"
 
             if self.verbose:
-                print(f"\n  ━━━ Step {step['index']}/{len(steps)}: {step_desc} ━━━")
+                logger.info("\n  ━━━ Step %d/%d: %s ━━━", step['index'], len(steps), step_desc)
 
             # ── 执行当前步骤 ──
             try:
@@ -453,7 +454,7 @@ class MultiAgentOrchestrator:
 
             if self.verbose:
                 status = "✅ PASS" if passed else "❌ FAIL"
-                print(f"  {status} — {reason}")
+                logger.info("  %s — %s", status, reason)
 
             if passed:
                 completed_steps.append(step_desc)
@@ -475,7 +476,7 @@ class MultiAgentOrchestrator:
             is_critical = reason.startswith("[CRITICAL]")
             if is_critical:
                 if self.verbose:
-                    print(f"  🚨 关键性错误，直接汇报人类处理")
+                    logger.error("  🚨 关键性错误，直接汇报人类处理")
                 step_results.append(
                     f"🚨 Step {step['index']}: {step_desc} — 需人工处理\n{reason}"
                 )
@@ -486,7 +487,7 @@ class MultiAgentOrchestrator:
             if retry_counts[i] < max_retries:
                 retry_counts[i] += 1
                 if self.verbose:
-                    print(f"  🔄 策略 1: 重试 ({retry_counts[i]}/{max_retries})")
+                    logger.warning("  🔄 策略 1: 重试 (%d/%d)", retry_counts[i], max_retries)
                 step_results.append(
                     f"⚠️ Step {step['index']} 重试 ({retry_counts[i]}/{max_retries}): {reason}"
                 )
@@ -495,14 +496,14 @@ class MultiAgentOrchestrator:
             # 策略 2: 重新规划（只允许一次，防止无限重规划）
             if not re_planned:
                 if self.verbose:
-                    print(f"  🧭 策略 2: 从失败点重新规划...")
+                    logger.warning("  🧭 策略 2: 从失败点重新规划...")
 
                 new_plan = self._re_plan_remaining(
                     file_path, step, reason, completed_steps
                 )
 
                 if self.verbose:
-                    print(f"  📋 新计划:\n{new_plan[:200]}")
+                    logger.info("  📋 新计划:\n%s", new_plan[:200])
 
                 new_steps = self._parse_plan_steps(new_plan)
                 if new_steps and new_steps[0]["tool"] != "full_plan":
@@ -517,7 +518,7 @@ class MultiAgentOrchestrator:
 
             # 策略 3: 跳过
             if self.verbose:
-                print(f"  ⏩ 策略 3: 跳过，标记为需人工处理")
+                logger.warning("  ⏩ 策略 3: 跳过，标记为需人工处理")
             step_results.append(
                 f"❌ Step {step['index']}: {step_desc} — 跳过（需人工处理）\n原因: {reason}"
             )
@@ -579,7 +580,7 @@ class MultiAgentOrchestrator:
                             output = tool.execute(**tc.arguments)
                             if self.verbose:
                                 display = output[:200] + "..." if len(output) > 200 else output
-                                print(f"  🔍 Reviewer 读取: {tc.name} → {display}")
+                                logger.debug("  🔍 Reviewer 读取: %s → %s", tc.name, display)
                         except Exception as e:
                             output = f"工具执行失败: {e}"
                     else:

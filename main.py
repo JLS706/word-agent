@@ -13,6 +13,8 @@ import os
 import sys
 import argparse
 
+from core.logger import logger
+
 # 确保项目根目录在 Python 路径中
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
@@ -132,11 +134,18 @@ def create_agent(config: dict, dry_run: bool = False):
     from core.skills import SkillManager
     skills_dir = os.path.join(PROJECT_ROOT, "skills")
     skill_manager = SkillManager(skills_dir, embed_client=embed_client)
-    print(f"已加载 {len(skill_manager.skills)} 个技能: "
-          f"{[s.name for s in skill_manager.skills]}")
+    logger.info("已加载 %d 个技能: %s",
+                len(skill_manager.skills),
+                [s.name for s in skill_manager.skills])
 
     # 创建 Executor Agent
     agent_config = config.get("agent", {})
+
+    # 根据配置调整日志级别
+    from core.logger import setup_logger
+    verbose = agent_config.get("verbose", True)
+    setup_logger(verbose=verbose)
+
     agent = Agent(
         llm=llm,
         tool_registry=registry,
@@ -165,16 +174,16 @@ def test_connection(config: dict):
     from core.llm import LLM
 
     llm_config = config.get("llm", {})
-    print(f"🔗 正在测试 LLM 连接...")
-    print(f"   模型: {llm_config.get('model', '未指定')}")
-    print(f"   地址: {llm_config.get('base_url', '未指定')}")
+    logger.info("🔗 正在测试 LLM 连接...")
+    logger.info("   模型: %s", llm_config.get('model', '未指定'))
+    logger.info("   地址: %s", llm_config.get('base_url', '未指定'))
 
     try:
         llm = LLM(**llm_config)
         reply = llm.test_connection()
-        print(f"✅ 连接成功！模型回复: {reply}")
+        logger.info("✅ 连接成功！模型回复: %s", reply)
     except Exception as e:
-        print(f"❌ 连接失败: {e}")
+        logger.error("❌ 连接失败: %s", e)
         import traceback
         traceback.print_exc()
 
@@ -249,7 +258,7 @@ def main():
     agent, orchestrator = create_agent(config, dry_run=args.dry_run)
 
     if args.dry_run:
-        print("🏜️  Dry-Run 模式已启用，工具将不会实际执行。")
+        logger.info("🏜️  Dry-Run 模式已启用，工具将不会实际执行。")
 
     interactive_loop(agent, orchestrator)
 

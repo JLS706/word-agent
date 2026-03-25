@@ -14,6 +14,8 @@ import os
 from datetime import datetime
 from typing import Optional
 
+from core.logger import logger
+
 
 class Memory:
     """本地记忆管理器（含向量召回）"""
@@ -158,7 +160,7 @@ class Memory:
             self._vector_store.save_cache(self._vector_cache_path)
         except Exception as e:
             # 向量存储失败不影响主流程
-            print(f"  [Memory] 向量存储失败(不影响主功能): {e}")
+            logger.warning("  [Memory] 向量存储失败(不影响主功能): %s", e)
 
     def recall_relevant(self, query: str, top_k: int = 3,
                         min_score: float = 0.45) -> str:
@@ -196,6 +198,6 @@ class Memory:
 
             return "\n\n".join(parts)
         except Exception as e:
-            print(f"  [Memory] 向量召回失败(不影响主功能): {e}")
+            logger.warning("  [Memory] 向量召回失败(不影响主功能): %s", e)
             return ""
 

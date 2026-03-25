@@ -18,6 +18,8 @@ import os
 import re
 from typing import Optional
 
+from core.logger import logger
+
 
 class Skill:
     """一个 Skill 的结构化表示"""
@@ -229,7 +231,7 @@ class SkillManager:
                 skill.embedding = emb
             self._embeddings_ready = True
         except Exception as e:
-            print(f"[Skills] Embedding 预计算失败: {e}")
+            logger.warning("[Skills] Embedding 预计算失败: %s", e)
 
     # ─────────────────────────────────────────
     # 输出

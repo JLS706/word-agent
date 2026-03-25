@@ -21,6 +21,8 @@ import multiprocessing
 import traceback
 from typing import Optional
 
+from core.logger import logger
+
 
 # ═════════════════════════════════════════════
 # 模块白名单 / 黑名单
@@ -477,10 +479,11 @@ def execute_sandboxed(code: str, timeout: int = STRICT_TIMEOUT) -> str:
                     return result.get("output", "✅ 代码执行完成（无输出）")
                 else:
                     return result.get("error", "❌ 未知错误")
-        except (urllib.error.URLError, Exception):
-            pass  # Docker 沙盒不可用，回退到本地
+        except (urllib.error.URLError, Exception) as e:
+            logger.warning("⚠️ Docker 沙盒不可用(%s)，回退到本地沙盒", e)
 
     # ── 回退：本地沙盒 ──
+    logger.debug("💻 使用本地沙盒执行")
     # Layer 1: AST 安全检查
     safety_error = check_code_safety(code, mode="strict")
     if safety_error:
@@ -547,8 +550,8 @@ def test_tool_sandboxed(code: str, timeout: int = TOOL_TIMEOUT) -> dict:
                     "test_output": result.get("test_output", ""),
                     "error": result.get("error", ""),
                 }
-        except (urllib.error.URLError, Exception):
-            pass  # Docker 沙盒不可用，回退到本地
+        except (urllib.error.URLError, Exception) as e:
+            logger.warning("⚠️ Docker 沙盒不可用(%s)，回退到本地沙盒", e)
 
     # ── Layer 1: AST 安全检查 ──
     safety_error = check_code_safety(code, mode="tool")

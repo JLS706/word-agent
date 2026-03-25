@@ -10,6 +10,7 @@ import time
 import traceback
 
 from core.llm import LLM
+from core.logger import logger
 from core.schema import AgentState, Message, Role, ToolResult
 from core.prompt import build_system_prompt
 from tools.base import ToolRegistry
@@ -85,7 +86,7 @@ class Agent:
         if self.memory:
             recalled = self.memory.recall_relevant(user_input)
             if self.verbose and recalled:
-                print(f"📌 已召回 {recalled.count('[相关度')} 条相关历史")
+                logger.info("📌 已召回 %d 条相关历史", recalled.count('[相关度'))
 
         # 根据用户输入匹配 Skills，动态重建系统提示词
         skills_ctx = ""
@@ -94,7 +95,7 @@ class Agent:
             skills_ctx = self.skill_manager.build_skills_context(matched)
             if self.verbose and matched:
                 names = [s.name for s in matched]
-                print(f"📚 已加载技能: {', '.join(names)}")
+                logger.info("📚 已加载技能: %s", ', '.join(names))
 
         # 重建系统提示词（含召回的历史 + 技能）
         self._build_system_prompt(skills_ctx, recalled)
@@ -104,15 +105,15 @@ class Agent:
         self.state = AgentState.THINKING
 
         if self.verbose:
-            print(f"\n{'='*60}")
-            print(f"🧠 Agent 收到指令: {user_input}")
-            print(f"{'='*60}")
+            logger.info("\n" + "=" * 60)
+            logger.info("🧠 Agent 收到指令: %s", user_input)
+            logger.info("=" * 60)
 
         openai_tools = self.tools.to_openai_tools()
 
         for step in range(1, self.max_steps + 1):
             if self.verbose:
-                print(f"\n--- 第 {step}/{self.max_steps} 步 ---")
+                logger.info("\n--- 第 %d/%d 步 ---", step, self.max_steps)
 
             # 调用 LLM
             self.state = AgentState.THINKING
@@ -121,7 +122,7 @@ class Agent:
             except Exception as e:
                 error_msg = f"❌ LLM 调用失败: {e}"
                 if self.verbose:
-                    print(error_msg)
+                    logger.error(error_msg)
                     traceback.print_exc()
                 self.state = AgentState.ERROR
                 return error_msg
@@ -134,7 +135,7 @@ class Agent:
                 self.state = AgentState.FINISHED
                 final_answer = response.content or "(Agent 没有给出回答)"
                 if self.verbose:
-                    print(f"\n✅ Agent 回答:\n{final_answer}")
+                    logger.info("\n✅ Agent 回答:\n%s", final_answer)
                 # 自动保存本轮操作到记忆（含向量存储）
                 self._save_session(user_input, final_answer)
                 return final_answer
@@ -157,7 +158,7 @@ class Agent:
         self.state = AgentState.ERROR
         timeout_msg = f"⚠️ Agent 已达到最大步数 ({self.max_steps})，强制停止。"
         if self.verbose:
-            print(timeout_msg)
+            logger.warning(timeout_msg)
         return timeout_msg
 
     # ─────────────────────────────────────────────
@@ -320,7 +321,7 @@ class Agent:
                 f"请检查工具名称拼写后重新调用。"
             )
             if self.verbose:
-                print(f"  ❌ {error}")
+                logger.error("  ❌ %s", error)
             return ToolResult(
                 tool_call_id=call_id,
                 name=name,
@@ -330,13 +331,13 @@ class Agent:
 
         if self.verbose:
             args_str = ", ".join(f"{k}={v!r}" for k, v in arguments.items())
-            print(f"  🔧 调用工具: {name}({args_str})")
+            logger.info("  🔧 调用工具: %s(%s)", name, args_str)
 
         # Dry-run 模式：不实际执行
         if self.dry_run:
             output = f"[DRY-RUN] 将调用 {name}，参数: {arguments}"
             if self.verbose:
-                print(f"  🏜️ {output}")
+                logger.info("  🏜️ %s", output)
             return ToolResult(
                 tool_call_id=call_id,
                 name=name,
@@ -355,7 +356,7 @@ class Agent:
             if self.verbose:
                 # 截断过长输出
                 display = output[:300] + "..." if len(output) > 300 else output
-                print(f"  ✅ 结果: {display}")
+                logger.info("  ✅ 结果: %s", display)
 
             # 执行成功 → 重置该工具的重试计数
             self._retry_counts[name] = 0
@@ -378,7 +379,7 @@ class Agent:
             if level == "transient" and attempt < max_attempts:
                 wait_sec = 2 ** attempt  # 指数退避: 2s, 4s, 8s
                 if self.verbose:
-                    print(f"  ⏳ 临时性错误，{wait_sec}秒后自动重试 ({attempt}/{max_attempts})...")
+                    logger.warning("  ⏳ 临时性错误，%d秒后自动重试 (%d/%d)...", wait_sec, attempt, max_attempts)
                 time.sleep(wait_sec)
                 return self._execute_tool(call_id, name, arguments)
 
@@ -387,7 +388,7 @@ class Agent:
                 name, arguments, e, attempt, max_attempts
             )
             if self.verbose:
-                print(f"  ❌ {summary}")
+                logger.error("  ❌ %s", summary)
             return ToolResult(
                 tool_call_id=call_id,
                 name=name,

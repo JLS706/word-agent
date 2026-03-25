@@ -13,6 +13,7 @@ DocMaster Agent - LLM 接口封装
 import json
 from typing import Optional
 
+from core.logger import logger
 from core.schema import Message, Role, ToolCall
 
 
@@ -78,7 +79,7 @@ class LLM:
             except Exception as e:
                 if "429" in str(e) and attempt < max_retries:
                     wait = 2 ** attempt * 5  # 5s, 10s, 20s
-                    print(f"   [LLM] 触发限流，{wait}秒后自动重试 ({attempt+1}/{max_retries})...")
+                    logger.warning("   [LLM] 触发限流，%d秒后自动重试 (%d/%d)...", wait, attempt+1, max_retries)
                     time.sleep(wait)
                 else:
                     raise

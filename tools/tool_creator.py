@@ -23,6 +23,7 @@ from datetime import datetime
 
 from tools.base import Tool, ToolRegistry
 from core.sandbox import check_code_safety, test_tool_sandboxed
+from core.logger import logger
 
 # 自定义工具目录
 _TOOLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "custom")
@@ -312,7 +313,7 @@ def _load_tool_from_file(file_path: str) -> Tool | None:
 
         return None
     except Exception as e:
-        print(f"  ⚠️ 加载自定义工具 {file_path} 失败: {e}")
+        logger.warning("  \u26a0\ufe0f \u52a0\u8f7d\u81ea\u5b9a\u4e49\u5de5\u5177 %s \u5931\u8d25: %s", file_path, e)
         return None
 
 

@@ -13,9 +13,11 @@ DocMaster Agent - 工作流 Checkpoint（断点续传）
 
 import os
 import json
-import time
+from datetime import datetime
 from typing import Optional
 from enum import Enum
+
+from core.logger import logger
 
 
 class WorkflowPhase(str, Enum):
@@ -139,7 +141,7 @@ class Checkpointer:
                 data = json.load(f)
             return WorkflowState.from_dict(data)
         except (json.JSONDecodeError, KeyError) as e:
-            print(f"[Checkpoint] 存档损坏，忽略: {e}")
+            logger.warning("[Checkpoint] 存档损坏，忽略: %s", e)
             return None
 
     def clear(self, task_id: str):
