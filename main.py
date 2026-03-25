@@ -84,9 +84,21 @@ def create_agent(config: dict, dry_run: bool = False):
     llm_config = config.get("llm", {})
     llm = LLM(**llm_config)
 
-    # 初始化本地记忆
+    # 初始化 Embedding 客户端（Memory 和 Skills 共用）
+    embed_client = None
+    try:
+        from core.embeddings import EmbeddingClient
+        embed_client = EmbeddingClient(
+            api_key=llm_config.get("api_key", ""),
+            base_url=llm_config.get("base_url", ""),
+            model=llm_config.get("embedding_model", "gemini-embedding-001"),
+        )
+    except Exception:
+        pass
+
+    # 初始化本地记忆（含向量记忆）
     memory_dir = os.path.join(PROJECT_ROOT, "memory")
-    memory = Memory(memory_dir)
+    memory = Memory(memory_dir, embed_client=embed_client)
 
     # 注册所有工具
     registry = ToolRegistry()
@@ -116,19 +128,9 @@ def create_agent(config: dict, dry_run: bool = False):
     if custom_count > 0:
         print(f"📦 已加载 {custom_count} 个自定义工具")
 
-    # 初始化 Skills 管理器
+    # 初始化 Skills 管理器（复用同一 embed_client）
     from core.skills import SkillManager
     skills_dir = os.path.join(PROJECT_ROOT, "skills")
-    # 尝试创建 Embedding 客户端用于语义匹配
-    try:
-        from core.embeddings import EmbeddingClient
-        embed_client = EmbeddingClient(
-            api_key=llm_config.get("api_key", ""),
-            base_url=llm_config.get("base_url", ""),
-            model=llm_config.get("embedding_model", "gemini-embedding-001"),
-        )
-    except Exception:
-        embed_client = None
     skill_manager = SkillManager(skills_dir, embed_client=embed_client)
     print(f"已加载 {len(skill_manager.skills)} 个技能: "
           f"{[s.name for s in skill_manager.skills]}")

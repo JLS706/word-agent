@@ -52,10 +52,14 @@ class Agent:
         # 构建基础系统提示词（无技能上下文，启动时用）
         self._build_system_prompt()
 
-    def _build_system_prompt(self, skills_context: str = ""):
+    def _build_system_prompt(self, skills_context: str = "",
+                             recalled_context: str = ""):
         """构建并设置系统提示词"""
         tool_desc = self.tools.describe()
-        memory_context = self.memory.get_context_summary() if self.memory else ""
+        memory_context = (
+            self.memory.get_context_summary(recalled_context)
+            if self.memory else ""
+        )
         system_msg = Message(
             role=Role.SYSTEM,
             content=build_system_prompt(tool_desc, memory_context, skills_context),
@@ -76,14 +80,24 @@ class Agent:
         Returns:
             Agent 的最终回答文本
         """
+        # ── 向量记忆召回（RAG 式）──
+        recalled = ""
+        if self.memory:
+            recalled = self.memory.recall_relevant(user_input)
+            if self.verbose and recalled:
+                print(f"📌 已召回 {recalled.count('[相关度')} 条相关历史")
+
         # 根据用户输入匹配 Skills，动态重建系统提示词
+        skills_ctx = ""
         if self.skill_manager:
             matched = self.skill_manager.match(user_input)
             skills_ctx = self.skill_manager.build_skills_context(matched)
-            self._build_system_prompt(skills_ctx)
             if self.verbose and matched:
                 names = [s.name for s in matched]
                 print(f"📚 已加载技能: {', '.join(names)}")
+
+        # 重建系统提示词（含召回的历史 + 技能）
+        self._build_system_prompt(skills_ctx, recalled)
 
         # 添加用户消息
         self.history.append(Message(role=Role.USER, content=user_input))
@@ -121,8 +135,8 @@ class Agent:
                 final_answer = response.content or "(Agent 没有给出回答)"
                 if self.verbose:
                     print(f"\n✅ Agent 回答:\n{final_answer}")
-                # 自动保存本轮操作到记忆
-                self._save_session(final_answer)
+                # 自动保存本轮操作到记忆（含向量存储）
+                self._save_session(user_input, final_answer)
                 return final_answer
 
             # 情况2: LLM 请求调用工具 → 逐一执行
@@ -381,8 +395,8 @@ class Agent:
                 success=False,
             )
 
-    def _save_session(self, summary: str):
-        """将本轮操作记录保存到记忆"""
+    def _save_session(self, user_input: str = "", summary: str = ""):
+        """将本轮操作记录保存到记忆（含向量存储）"""
         if self.memory and self._session_tools:
             file_path = self._session_file or "unknown"
             self.memory.add_session(
@@ -390,6 +404,10 @@ class Agent:
                 actions=self._session_tools,
                 summary=summary[:200],  # 截断过长摘要
             )
+
+        # 向量记忆：存入本轮 Q+A 摘要
+        if self.memory and user_input:
+            self.memory.add_to_vector(user_input, summary)
 
     def reset(self):
         """重置 Agent 状态（保留系统提示词）"""
