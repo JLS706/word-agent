@@ -76,6 +76,7 @@ def create_agent(config: dict, dry_run: bool = False):
         SaveLearnedRuleTool, ForgetLearnedRuleTool, ListLearnedRulesTool
     )
     from tools.rag import IndexDocumentTool, SearchDocumentTool
+    from tools.doc_summarizer import SummarizeDocumentTool
     from tools.word_cleanup import CloseWordTool
     from tools.tool_creator import (
         CreateToolTool, ApproveToolTool, ListCustomToolsTool,
@@ -121,6 +122,7 @@ def create_agent(config: dict, dry_run: bool = False):
     registry.register(IndexDocumentTool())           # RAG：文档索引
     registry.register(SearchDocumentTool())          # RAG：语义搜索
     registry.register(CloseWordTool())                # Word 进程清理
+    registry.register(SummarizeDocumentTool())         # 全文摘要(Map-Reduce)
     registry.register(CreateToolTool())               # 动态工具创建
     registry.register(ApproveToolTool(registry))      # 工具审批激活
     registry.register(ListCustomToolsTool())          # 列出自定义工具
