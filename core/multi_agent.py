@@ -97,6 +97,48 @@ class MultiAgentOrchestrator:
             os.remove(backup_path)
             logger.debug("🗑️ 已清理备份文件")
 
+    def _check_precondition(
+        self,
+        file_path: str,
+        step: dict,
+        prev_step_result: str,
+    ) -> tuple[bool, str]:
+        """
+        前置条件检查（双向握手的第一次握手）。
+
+        在每步执行前验证：
+          1. 文档文件是否存在且可访问
+          2. 上一步的结果是否正常（没有留下破坏性状态）
+
+        Returns:
+            (ok: bool, reason: str)
+        """
+        step_desc = f"{step['tool']} ({step['desc']})"
+
+        # 检查 1：文档文件是否存在
+        if not os.path.exists(file_path):
+            return False, f"[PRECONDITION] 文档文件不存在: {file_path}"
+
+        # 检查 2：文件是否可读（没被占用锁死）
+        try:
+            with open(file_path, 'rb') as f:
+                f.read(1)  # 只读 1 字节，验证可访问性
+        except (PermissionError, OSError) as e:
+            return False, f"[PRECONDITION] 文档无法访问: {e}"
+
+        # 检查 3：上一步结果是否含有破坏性错误标识
+        if prev_step_result:
+            critical_signs = ["CRITICAL", "损坏", "崩溃", "corrupt", "严重错误"]
+            for sign in critical_signs:
+                if sign in prev_step_result:
+                    return False, (
+                        f"[PRECONDITION] 上一步留下破坏性状态"
+                        f"（检测到 '{sign}'），"
+                        f"当前步骤 '{step_desc}' 的前置条件不满足"
+                    )
+
+        return True, ""
+
     def run_pipeline(self, file_path: str) -> str:
         """Run pipeline with checkpoint save/resume support."""
         task_id = self._make_task_id(file_path)
@@ -500,19 +542,30 @@ class MultiAgentOrchestrator:
             if self.verbose:
                 logger.info("\n  ━━━ Step %d/%d: %s ━━━", step['index'], len(steps), step_desc)
 
-            # ── 执行当前步骤 ──
-            try:
-                prompt = (
-                    f"请执行以下步骤：{step_desc}\n"
-                    f"文件路径: {file_path}\n"
-                    f"注意: modify_in_place 必须为 true。只执行这一个步骤。"
-                )
-                result = self.executor.run(prompt)
-            except Exception as e:
-                result = f"执行异常: {e}"
+            # ── 双向握手：第一次握手（前置条件检查）──
+            prev_result = step_results[-1] if step_results else ""
+            pre_ok, pre_reason = self._check_precondition(
+                file_path, step, prev_result
+            )
+            if not pre_ok:
+                if self.verbose:
+                    logger.warning("⚠️ 前置条件不满足: %s", pre_reason)
+                # 前置条件失败 → 直接打回，视为失败
+                passed, reason = False, pre_reason
+            else:
+                # ── 双向握手：执行当前步骤 ──
+                try:
+                    prompt = (
+                        f"请执行以下步骤：{step_desc}\n"
+                        f"文件路径: {file_path}\n"
+                        f"注意: modify_in_place 必须为 true。只执行这一个步骤。"
+                    )
+                    result = self.executor.run(prompt)
+                except Exception as e:
+                    result = f"执行异常: {e}"
 
-            # ── 验证当前步骤 ──
-            passed, reason = self._verify_step(step, result)
+                # ── 双向握手：第二次握手（结果验证）──
+                passed, reason = self._verify_step(step, result)
 
             if self.verbose:
                 status = "✅ PASS" if passed else "❌ FAIL"
