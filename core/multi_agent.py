@@ -60,11 +60,11 @@ class MultiAgentOrchestrator:
     @staticmethod
     def _discard_word_changes(file_path: str):
         """
-        丢弃 Word 内存中的脏修改（不保存关闭）。
+        丢弃 Word 内存中的脏修改（Pipeline 级别兜底）。
 
-        两级回退：
-          1. doc.Close(SaveChanges=0) — 礼貌关闭
-          2. taskkill /f — Word 进程也挂了就暴力杀
+        注意：单个工具调用时应优先使用 COMSafeLock（core/com_watchdog.py），
+        它提供 DispatchEx 进程隔离 + PID 精准狙击。
+        本方法是 Pipeline 级别的最终兜底，处理 COMSafeLock 之外的残留进程。
         """
         abs_path = os.path.abspath(file_path).lower()
         try:
