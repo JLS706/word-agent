@@ -556,11 +556,22 @@ class MultiAgentOrchestrator:
                 # 前置条件失败 → 直接打回，视为失败
                 passed, reason = False, pre_reason
             else:
-                # ── 双向握手：执行当前步骤 ──
+                # ── 双向握手：执行当前步骤（含上下文交接）──
                 try:
+                    # 构建交接上下文：前序步骤的浓缩摘要
+                    handover = ""
+                    if completed_steps:
+                        handover = (
+                            "\n已完成的前序步骤：\n"
+                            + "\n".join(
+                                f"  ✅ {s}" for s in completed_steps
+                            )
+                            + "\n"
+                        )
                     prompt = (
                         f"请执行以下步骤：{step_desc}\n"
                         f"文件路径: {file_path}\n"
+                        f"{handover}"
                         f"注意: modify_in_place 必须为 true。只执行这一个步骤。"
                     )
                     result = self.executor.run(prompt)
