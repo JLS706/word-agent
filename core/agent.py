@@ -49,6 +49,7 @@ class Agent:
         self._session_tools: list[str] = []   # 本轮执行过的工具名
         self._session_file: str = ""           # 本轮操作的文件路径
         self._retry_counts: dict[str, int] = {}  # 工具重试计数器
+        self._compress_threshold = 10  # history 消息数超过此值时触发压缩
 
         # 构建基础系统提示词（无技能上下文，启动时用）
         self._build_system_prompt()
@@ -115,6 +116,10 @@ class Agent:
             if self.verbose:
                 logger.info("\n--- 第 %d/%d 步 ---", step, self.max_steps)
 
+            # ── Scratchpad 压缩：防止 history 擑爆 Prompt ──
+            if len(self.history) > self._compress_threshold:
+                self._compress_history()
+
             # 调用 LLM
             self.state = AgentState.THINKING
             try:
@@ -160,6 +165,64 @@ class Agent:
         if self.verbose:
             logger.warning(timeout_msg)
         return timeout_msg
+
+    # ─────────────────────────────────────────────
+    # Scratchpad 压缩（防止 Token 爆炸）
+    # ─────────────────────────────────────────────
+
+    def _compress_history(self):
+        """
+        当 history 超过阈值时，压缩旧的工具交互为一句 Scratchpad。
+
+        压缩前: [System, User, LLM₁, Tool₁, LLM₂, Tool₂, ..., LLM₇, Tool₇]
+        压缩后: [System, User, Scratchpad("已完成: ..."), LLM₆, Tool₆, LLM₇, Tool₇]
+                                ↑ 一句话概括          ↑ 只保留最近 2 轮
+        """
+        # 保留: System(0) + User(1) + 最近 4 条消息
+        keep_head = 2  # System + User
+        keep_tail = 4  # 最近 2 轮工具交互 (LLM+Tool × 2)
+
+        if len(self.history) <= keep_head + keep_tail:
+            return  # 不够压缩
+
+        # 提取要压缩的中间部分
+        middle = self.history[keep_head:-keep_tail]
+        if not middle:
+            return
+
+        # 从中间部分提取工具调用摘要（不调 LLM，纯规则提取）
+        tool_summaries = []
+        for msg in middle:
+            if msg.role == Role.TOOL:
+                # 截取工具结果的第一行作为摘要
+                first_line = (msg.content or "").split("\n")[0][:80]
+                tool_name = msg.name or "unknown"
+                tool_summaries.append(f"{tool_name}: {first_line}")
+
+        scratchpad_text = (
+            "[已完成步骤摘要] "
+            + "; ".join(tool_summaries) if tool_summaries
+            else "[已完成若干步骤]"
+        )
+
+        scratchpad_msg = Message(
+            role=Role.ASSISTANT,
+            content=scratchpad_text,
+        )
+
+        # 重组 history: 头部 + Scratchpad + 尾部
+        self.history = (
+            self.history[:keep_head]
+            + [scratchpad_msg]
+            + self.history[-keep_tail:]
+        )
+
+        if self.verbose:
+            logger.debug(
+                "  📋 Scratchpad 压缩: %d 条消息 → %d 条",
+                keep_head + len(middle) + keep_tail,
+                len(self.history),
+            )
 
     # ─────────────────────────────────────────────
     # 错误分类器（三级分类）

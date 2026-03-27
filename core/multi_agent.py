@@ -539,6 +539,9 @@ class MultiAgentOrchestrator:
             retry_counts.setdefault(i, 0)
             step_desc = f"{step['tool']} ({step['desc']})"
 
+            # ── 步骤间清理：清除上一步的 Observation ──
+            self.executor.reset()
+
             if self.verbose:
                 logger.info("\n  ━━━ Step %d/%d: %s ━━━", step['index'], len(steps), step_desc)
 
