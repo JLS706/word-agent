@@ -9,7 +9,8 @@
 ### 文档处理工具
 
 | 工具 | 功能描述 |
-|------|---------| 
+|------|---------|
+| `inspect_document_format` | 📐 **格式检查**（样式/字体/缩进/行距/对齐），内置学术规范自动诊断 |
 | `format_references` | 参考文献格式修复（字体统一、Sentence Case、期刊名斜体） |
 | `create_reference_crossrefs` | 文献交叉引用生成（[1][2] → 可跳转域代码） |
 | `create_figure_crossrefs` | 图注交叉引用生成（图X.Y → 可跳转域代码） |
@@ -17,15 +18,28 @@
 | `check_acronym_definitions` | 缩写定义检测（检测 MIMO 等缩写是否有全称） |
 | `convert_latex_to_mathtype` | LaTeX 公式 → MathType 批量转换 |
 
+### 文档分析工具
+
+| 工具 | 功能描述 |
+|------|---------|
+| `read_document` | 读取文档内容（全文/标题结构/参考文献），只看内容不查格式 |
+| `analyze_document` | 扫描文档现状（参考文献/图注/公式/缩写统计） |
+| `summarize_document` | Map-Reduce 全文摘要（分块摘要 → 合成总结，覆盖全文） |
+| `index_document` + `search_document` | RAG 向量检索（文档索引 → 语义搜索） |
+
 ### 高级能力
 
 | 能力 | 描述 |
-|------|---------| 
+|------|---------|
 | `execute_python` | 安全沙盒代码解释器（三层安全防护 + 进程级隔离） |
+| `create_tool` / `approve_tool` | 🧬 Agent 自主创造新工具（编写 → 沙盒测试 → 审批注册） |
 | `save/forget/list_learned_rules` | Agent 自学习系统（将经验存为规则，持续改进） |
 | Multi-Agent 流水线 | Planner → Executor → Reviewer 三角色协作 |
+| Skill 插件系统 | 按需加载技能手册（关键词 + Embedding 双层匹配） |
+| 多 Key 自动轮换 | API Key 失效时自动切换到下一个可用 Key |
 | 结构化错误恢复 | 三级错误分类 + 自动重试 + 引导 LLM 自修正 |
-| 回溯修正 (Backtracking) | 逐步执行→每步验证→失败时自动回溯 |
+| 回溯修正 (Backtracking) | 逐步执行 → 每步验证 → 失败时自动回溯 |
+| Checkpoint 断点续传 | 流水线中途中断后可从断点恢复 |
 
 ## 🚀 快速开始
 
@@ -41,10 +55,16 @@ pip install -r requirements.txt
 cp config/config.example.toml config/config.toml
 ```
 
-编辑 `config/config.toml`，填入你的 API Key。推荐使用免费方案：
+编辑 `config/config.toml`，填入你的 API Key。支持多 Key 逗号分隔（自动 Failover）：
+
+```toml
+api_key = "key1, key2, key3"    # 失效自动切换到下一个
+```
+
+推荐使用免费方案：
 
 | 方案 | 申请地址 | 免费额度 |
-|------|---------|---------| 
+|------|---------|---------|
 | **Google Gemini** | [aistudio.google.com](https://aistudio.google.com/apikey) | 每天 1500 次请求 |
 | **智谱 GLM-4-Flash** | [open.bigmodel.cn](https://open.bigmodel.cn/) | 永久免费 |
 | **硅基流动** | [siliconflow.cn](https://cloud.siliconflow.cn/) | 注册送 2000 万 Token |
@@ -62,25 +82,39 @@ python main.py
 ```
 
 然后输入自然语言指令，如：
+- `帮我检查一下论文的格式有没有问题`
 - `帮我格式化参考文献`
 - `生成文献交叉引用`
 - `检查一下缩写有没有定义`
-- `把图注转成Word题注，然后生成图注交叉引用`
+- `总结一下这篇论文的主要内容`
+- `pipeline C:\path\to\论文.docx`（Multi-Agent 全流程）
 
 ## 🏗️ 项目架构
 
 ```
 agent/
-├── config/config.toml          # LLM 配置
+├── config/
+│   ├── config.example.toml     # 配置模板（多方案示例）
+│   └── config.toml             # 实际配置（.gitignore）
 ├── core/
 │   ├── schema.py               # 数据模型（Message, ToolCall, AgentState）
-│   ├── llm.py                  # LLM 接口封装（OpenAI 兼容）
-│   ├── agent.py                # ReAct Agent 核心（含结构化错误恢复）
-│   ├── prompt.py               # System Prompt 模板
-│   ├── memory.py               # 本地持久化记忆系统
-│   └── multi_agent.py          # Multi-Agent 流水线（含回溯修正）
+│   ├── llm.py                  # LLM 接口封装（多 Key 自动轮换）
+│   ├── agent.py                # ReAct Agent 核心（含结构化错误恢复 + Scratchpad 压缩）
+│   ├── prompt.py               # System Prompt 模板（Executor / Planner / Reviewer）
+│   ├── memory.py               # 本地持久化记忆系统（含向量召回）
+│   ├── embeddings.py           # Embedding + 向量存储（纯 numpy 实现）
+│   ├── multi_agent.py          # Multi-Agent 流水线（含回溯修正 + Checkpoint）
+│   ├── skills.py               # Skill 插件管理器（关键词 + Embedding 双层匹配）
+│   ├── sandbox.py              # 安全沙盒（三层防护 + Docker 隔离）
+│   ├── checkpoint.py           # 断点续传状态管理
+│   └── com_watchdog.py         # Word COM 进程隔离守护
 ├── tools/
 │   ├── base.py                 # Tool 基类 + ToolRegistry
+│   ├── doc_format_inspector.py # 📐 文档格式检查（样式/字体/缩进/行距诊断）
+│   ├── doc_reader.py           # 文档内容读取
+│   ├── doc_summarizer.py       # Map-Reduce 全文摘要
+│   ├── rag.py                  # RAG 向量检索（索引 + 搜索）
+│   ├── pipeline.py             # 文档分析（宏观扫描）
 │   ├── ref_formatter.py        # 参考文献格式化
 │   ├── ref_crossref.py         # 文献交叉引用
 │   ├── fig_crossref.py         # 图注交叉引用
@@ -89,10 +123,19 @@ agent/
 │   ├── latex_converter.py      # LaTeX 转换
 │   ├── code_interpreter.py     # 安全沙盒代码解释器
 │   ├── learned_rules.py        # Agent 自学习规则
-│   └── pipeline.py             # 文档分析（Planner 用）
+│   ├── tool_creator.py         # 🧬 动态工具创建引擎
+│   ├── memory_tool.py          # 记忆查询/保存
+│   └── word_cleanup.py         # Word 进程清理
+├── skills/                     # Skill 插件目录（.md 格式，热加载）
+│   ├── paper_formatting.md     # 论文排版标准流
+│   ├── doc_summary.md          # 文档摘要技能
+│   ├── rag_search.md           # RAG 搜索技能
+│   └── data_analysis.md        # 数据分析技能
 ├── memory/                     # 持久化存储
-│   ├── history.json            # 对话历史
-│   └── learned_rules.json      # 学习到的规则
+│   ├── history.json            # 操作历史
+│   ├── learned_rules.json      # 自学习规则
+│   └── memory_vectors.json     # 向量记忆
+├── sandbox/                    # Docker 沙盒微服务
 └── main.py                     # 入口
 ```
 
@@ -101,15 +144,19 @@ agent/
 ### 单 Agent 模式（ReAct 循环）
 
 ```
-用户: "帮我处理参考文献格式和交叉引用"
+用户: "帮我检查论文格式并处理参考文献"
   ↓
-Agent (Think): 需要先调用 format_references，再调用 create_reference_crossrefs
+[Skill 匹配] "论文排版标准流" → 注入 System Prompt
   ↓
-Agent (Act): 执行 format_references → 结果/错误
+Agent (Think): 先用 inspect_document_format 检查格式，再处理参考文献
+  ↓
+Agent (Act): inspect_document_format → 发现3处缩进问题
+  ↓
+Agent (Act): format_references → 修复25条参考文献
   ↓
 Agent (Observe): 成功 → 继续 | 失败 → 结构化错误引导自修正
   ↓
-Agent: "已完成！格式修复25条，交叉引用替换42处。"
+Agent: "已完成！发现3处格式问题，参考文献已修复25条。"
 ```
 
 ### Multi-Agent 流水线（含回溯修正）
@@ -123,7 +170,18 @@ Phase 2 — Executor (逐步执行 + 回溯):
   Step 3 → 验证 ❌ → 关键错误? 🚨 汇报人类
                     → 普通错误? 🔄 重试 → 🧭 重规划 → ⏩ 跳过
   ↓
-Phase 3 — Reviewer: 读取处理后文档 → 验证并输出报告
+Phase 3 — Reviewer: 读取内容 + 检查格式 → 验证并输出报告（S/A/B/C/D 评分）
+```
+
+### 格式感知架构（查格式 vs 查内容，职责分离）
+
+```
+                    ┌─ read_document ──→ 纯文本内容（适合摘要/搜索/问答）
+用户文档 ──→ COM ──┤
+                    └─ inspect_format ──→ 格式属性报告（适合排版诊断/修复验证）
+                         ↑
+                    只输出20字定位标记
+                    不输出段落全文（省 Token）
 ```
 
 ### 安全沙盒（三层防护 + Docker 隔离）
