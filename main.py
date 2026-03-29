@@ -79,6 +79,7 @@ def create_agent(config: dict, dry_run: bool = False):
     from tools.doc_summarizer import SummarizeDocumentTool
     from tools.doc_format_inspector import InspectDocFormatTool
     from tools.word_cleanup import CloseWordTool
+    from tools.pipeline_tool import RunPipelineTool, set_orchestrator
     from tools.tool_creator import (
         CreateToolTool, ApproveToolTool, ListCustomToolsTool,
         load_custom_tools,
@@ -128,6 +129,7 @@ def create_agent(config: dict, dry_run: bool = False):
     registry.register(CreateToolTool())               # 动态工具创建
     registry.register(ApproveToolTool(registry))      # 工具审批激活
     registry.register(ListCustomToolsTool())          # 列出自定义工具
+    registry.register(RunPipelineTool())               # Multi-Agent 流水线触发
 
     # 自动加载已审批的自定义工具
     custom_count = load_custom_tools(registry)
@@ -169,6 +171,9 @@ def create_agent(config: dict, dry_run: bool = False):
         verbose=agent_config.get("verbose", True),
         checkpoint_dir=os.path.join(PROJECT_ROOT, "checkpoints"),
     )
+
+    # 注入 orchestrator 到 pipeline_tool（让 Agent 可以自主调用流水线）
+    set_orchestrator(orchestrator)
 
     return agent, orchestrator
 
