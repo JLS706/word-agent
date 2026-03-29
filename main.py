@@ -205,7 +205,6 @@ def interactive_loop(agent, orchestrator=None):
     print("  输入 'quit' 或 'exit' 退出")
     print("  输入 'reset' 重置对话历史")
     print("  输入 'tools' 查看可用工具列表")
-    print("  输入 'pipeline <文件路径>' 启动 Multi-Agent 流水线")
     print("=" * 60)
 
     while True:
@@ -230,24 +229,103 @@ def interactive_loop(agent, orchestrator=None):
             print("\n📦 可用工具:")
             print(agent.tools.describe())
             continue
-        elif cmd.startswith("pipeline"):
-            # Multi-Agent 流水线模式
-            parts = user_input.split(maxsplit=1)
-            if len(parts) < 2:
-                print("⚠️ 用法: pipeline <Word文档路径>")
-                print("   例: pipeline C:\\Users\\xxx\\论文.docx")
-                continue
-            file_path = parts[1].strip()
-            if orchestrator:
-                orchestrator.run_pipeline(file_path)
-            else:
-                print("⚠️ Multi-Agent 模式未初始化。")
+
+        # ── 任务复杂度路由器（关键词规则，零 API 调用）──
+        route, file_path = _classify_task(user_input)
+
+        if route == "pipeline" and orchestrator and file_path:
+            logger.info("🧭 [路由器] 检测到全流程任务，自动启动 Multi-Agent 流水线")
+            orchestrator.run_pipeline(file_path)
             continue
 
-        # 普通对话走单 Agent 模式
+        # 普通对话走单 Agent 模式（如果路由器判定为 pipeline 但没提取到文件路径，
+        # 则交给 Agent 自行处理，Agent 可能会调用 run_pipeline 工具）
         response = agent.run(user_input)
         if not agent.verbose:
             print(f"\n🤖 Agent: {response}")
+
+
+# ─────────────────────────────────────────────
+# 任务复杂度分类器（关键词规则，零 API 调用）
+# ─────────────────────────────────────────────
+
+# 全流程关键词（命中任意一个 → pipeline 模式）
+_PIPELINE_KEYWORDS = [
+    # 显式全流程指令
+    "全面处理", "完整排版", "全部处理", "所有格式",
+    "一键处理", "一键排版", "全套", "全流程",
+    "从头到尾", "帮我全部做", "全部做了", "都处理",
+    "完整处理", "整体排版", "统一处理",
+    # 显式 pipeline 指令（兼容旧用法）
+    "pipeline",
+]
+
+# 单一任务关键词（命中 → 强制单 Agent，即使同时命中全流程词）
+_SINGLE_TASK_OVERRIDES = [
+    "只检查", "只处理", "只格式化", "只看",
+    "仅检查", "仅处理",
+    "检查一下", "看一下",
+    "你好", "hello", "hi",
+]
+
+
+def _classify_task(user_input: str) -> tuple[str, str]:
+    """
+    任务复杂度分类器。
+
+    策略（两层规则，零 API 调用）：
+      1. 先检查"单一任务覆盖词" → 如果命中，强制走单 Agent
+      2. 再检查"全流程关键词" → 如果命中，走 pipeline
+
+    Returns:
+        (route, file_path)
+        route: "pipeline" | "single"
+        file_path: 提取到的文件路径（可能为空）
+    """
+    input_lower = user_input.lower()
+
+    # Layer 1: 单一任务覆盖（优先级最高）
+    for kw in _SINGLE_TASK_OVERRIDES:
+        if kw in input_lower:
+            return "single", ""
+
+    # Layer 2: 全流程关键词
+    hit = False
+    for kw in _PIPELINE_KEYWORDS:
+        if kw in input_lower:
+            hit = True
+            break
+
+    if not hit:
+        return "single", ""
+
+    # 提取文件路径（支持 .docx 结尾的路径）
+    file_path = _extract_file_path(user_input)
+    return "pipeline", file_path
+
+
+def _extract_file_path(text: str) -> str:
+    """
+    从用户输入中提取 .docx 文件路径。
+
+    支持格式：
+      - C:\\Users\\xxx\\论文.docx
+      - "C:\\Users\\xxx\\论文.docx"
+      - C:/Users/xxx/论文.docx
+    """
+    import re
+
+    # 匹配 Windows 路径（带盘符）
+    match = re.search(r'[A-Za-z]:[\\\/][^\s"\']*\.docx', text, re.IGNORECASE)
+    if match:
+        return match.group(0)
+
+    # 匹配相对路径
+    match = re.search(r'[\w\u4e00-\u9fff][^\s"\']*\.docx', text, re.IGNORECASE)
+    if match:
+        return match.group(0)
+
+    return ""
 
 
 def main():
