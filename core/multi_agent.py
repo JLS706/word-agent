@@ -683,15 +683,19 @@ class MultiAgentOrchestrator:
                         f"Executor 已完成处理，请验证结果。\n\n"
                         f"处理后的文件路径: {target_path}\n\n"
                         f"Executor 的执行报告:\n{exec_result[:500]}\n\n"
-                        f"请调用 read_document 读取文档内容，然后输出验证报告。"
+                        f"请按以下步骤审查：\n"
+                        f"1. 调用 read_document 检查内容（交叉引用、参考文献等）\n"
+                        f"2. 调用 inspect_document_format 检查格式（样式、缩进、字体等）\n"
+                        f"3. 输出验证报告。"
                     ),
                 ),
             ]
 
-            # Reviewer 只能调用 read_document
+            # Reviewer 可调用 read_document（查内容）和 inspect_document_format（查格式）
             reviewer_tools = []
+            reviewer_allowed = {"read_document", "inspect_document_format"}
             for t in self.tools.to_openai_tools():
-                if t["function"]["name"] == "read_document":
+                if t["function"]["name"] in reviewer_allowed:
                     reviewer_tools.append(t)
 
             # ReAct 循环（最多3步）

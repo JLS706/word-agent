@@ -77,6 +77,7 @@ def create_agent(config: dict, dry_run: bool = False):
     )
     from tools.rag import IndexDocumentTool, SearchDocumentTool
     from tools.doc_summarizer import SummarizeDocumentTool
+    from tools.doc_format_inspector import InspectDocFormatTool
     from tools.word_cleanup import CloseWordTool
     from tools.tool_creator import (
         CreateToolTool, ApproveToolTool, ListCustomToolsTool,
@@ -107,6 +108,7 @@ def create_agent(config: dict, dry_run: bool = False):
     registry = ToolRegistry()
     registry.register(AnalyzeDocumentTool())      # 文档分析（Pipeline规划）
     registry.register(DocReaderTool())             # 文档读取（供LLM分析）
+    registry.register(InspectDocFormatTool())       # 文档格式检查（样式/字体/缩进）
     registry.register(RecallHistoryTool(memory))   # 记忆查询
     registry.register(SavePreferenceTool(memory))  # 偏好保存
     registry.register(RefFormatterTool())

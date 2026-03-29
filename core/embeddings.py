@@ -20,24 +20,70 @@ from typing import Optional
 
 class EmbeddingClient:
     """
-    OpenAI Embedding API 客户端。
+    OpenAI Embedding API 客户端（支持多 Key 自动轮换）。
     
     将文本转为高维向量（1536 维），
     语义相近的文本在向量空间中距离更近。
     """
 
+    # Key 失效的错误信号
+    _KEY_ERROR_SIGNALS = [
+        "400", "401", "403",
+        "API_KEY_INVALID", "expired", "invalid",
+        "PERMISSION_DENIED", "UNAUTHENTICATED",
+    ]
+
     def __init__(self, api_key: str, base_url: str, model: str = "gemini-embedding-001"):
         from openai import OpenAI
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        from core.llm import parse_api_keys
+
         self.model = model
+        self.base_url = base_url
+        self._api_keys = parse_api_keys(api_key)
+        self._current_key_index = 0
+        self.client = OpenAI(
+            api_key=self._api_keys[self._current_key_index],
+            base_url=base_url,
+        )
+
+    def _switch_key(self) -> bool:
+        """切换到下一个 Key，返回是否还有更多 Key 可尝试"""
+        if len(self._api_keys) <= 1:
+            return False
+        self._current_key_index = (self._current_key_index + 1) % len(self._api_keys)
+        from openai import OpenAI
+        self.client = OpenAI(
+            api_key=self._api_keys[self._current_key_index],
+            base_url=self.base_url,
+        )
+        return True
+
+    def _is_key_error(self, error: Exception) -> bool:
+        error_str = str(error)
+        return any(sig in error_str for sig in self._KEY_ERROR_SIGNALS)
+
+    def _call_with_failover(self, func):
+        """带多 Key Failover 的调用包装"""
+        keys_tried = 0
+        last_error = None
+        while keys_tried < len(self._api_keys):
+            try:
+                return func()
+            except Exception as e:
+                last_error = e
+                if self._is_key_error(e) and "429" not in str(e):
+                    if self._switch_key():
+                        keys_tried += 1
+                        continue
+                raise
+        raise last_error
 
     def embed(self, text: str) -> list[float]:
         """单条文本 → 向量"""
-        resp = self.client.embeddings.create(
-            input=text,
-            model=self.model,
-        )
-        return resp.data[0].embedding
+        def _do():
+            resp = self.client.embeddings.create(input=text, model=self.model)
+            return resp.data[0].embedding
+        return self._call_with_failover(_do)
 
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
         """
@@ -50,13 +96,12 @@ class EmbeddingClient:
         batch_size = 100  # 每批 100 条
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i + batch_size]
-            resp = self.client.embeddings.create(
-                input=batch,
-                model=self.model,
-            )
-            # 按 index 排序确保顺序正确
-            sorted_data = sorted(resp.data, key=lambda x: x.index if x.index is not None else -1)
-            all_embeddings.extend([d.embedding for d in sorted_data])
+            def _do(b=batch):
+                resp = self.client.embeddings.create(input=b, model=self.model)
+                sorted_data = sorted(resp.data, key=lambda x: x.index if x.index is not None else -1)
+                return [d.embedding for d in sorted_data]
+            result = self._call_with_failover(_do)
+            all_embeddings.extend(result)
         return all_embeddings
 
 

@@ -153,27 +153,10 @@ class AnalyzeDocumentTool(Tool):
                 report.append(f"  - 示例: {', '.join(sample)}")
                 report.append(f"  - 建议: 可执行 check_acronym_definitions")
 
-            # ── 执行计划建议 ──
-            plan = []
-            if handwritten_captions > 0:
-                plan.append("1. convert_handwritten_captions (手写图注转题注)")
-            if (word_captions > 0 or handwritten_captions > 0) and fig_refs_in_body > 0:
-                plan.append(f"{len(plan)+1}. create_figure_crossrefs (图注交叉引用)")
-            if has_refs and ref_count > 0:
-                plan.append(f"{len(plan)+1}. format_references (参考文献格式化)")
-            if has_refs and ref_citations_in_body > 0:
-                plan.append(f"{len(plan)+1}. create_reference_crossrefs (文献交叉引用)")
-            if acronyms:
-                plan.append(f"{len(plan)+1}. check_acronym_definitions (缩写词检测)")
-            if latex_inline + latex_block > 0:
-                plan.append(f"{len(plan)+1}. convert_latex_to_mathtype (LaTeX公式转换)")
-
-            if plan:
-                report.append(f"\n=== 推荐执行计划 ===")
-                for step in plan:
-                    report.append(f"  {step}")
-                report.append(f"\n⚠️ 重要: 请严格按以上顺序执行，且每个工具调用时 modify_in_place 必须为 true，")
-                report.append(f"   否则每个工具各自另存副本，后续工具读取的仍是原始文件，修改不会累积。")
+            # ── 提示 Agent 根据 Skill 决定下一步 ──
+            report.append(f"\n=== 下一步 ===")
+            report.append(f"请根据以上检测结果，结合你已加载的技能手册，决定执行哪些工具。")
+            report.append(f"如果用户要求检查格式，请调用 inspect_document_format 进行逐段格式检查。")
 
             if opened_by_us:
                 doc.Close(SaveChanges=0)
