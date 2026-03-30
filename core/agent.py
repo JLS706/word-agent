@@ -15,6 +15,13 @@ from core.schema import AgentState, Message, Role, ToolResult
 from core.prompt import build_system_prompt
 from tools.base import ToolRegistry
 
+# Word 相关工具名集合（用于 L1 后校验：自动检查 close_word 是否被遗漏）
+WORD_TOOLS = {
+    "read_document", "inspect_document_format", "format_references",
+    "ref_crossref", "fig_crossref", "fig_caption", "acronym_checker",
+    "summarize_document", "analyze_document", "index_document",
+}
+
 
 class Agent:
     """
@@ -49,8 +56,8 @@ class Agent:
         self._session_tools: list[str] = []   # 本轮执行过的工具名
         self._session_file: str = ""           # 本轮操作的文件路径
         self._retry_counts: dict[str, int] = {}  # 工具重试计数器
-        self._token_warning = 4000   # Token 水位：触发规则压缩
-        self._token_critical = 6000  # Token 水位：触发 LLM 深度压缩
+        self._token_warning = 6000   # Token 水位：触发规则压缩（4000→6000，避免过早压缩稀释 L1）
+        self._token_critical = 8000  # Token 水位：触发 LLM 深度压缩
 
         # 构建基础系统提示词（无技能上下文，启动时用）
         self._build_system_prompt()
@@ -88,7 +95,7 @@ class Agent:
         if self.memory:
             recalled = self.memory.recall_relevant(user_input)
             if self.verbose and recalled:
-                logger.info("📌 已召回 %d 条相关历史", recalled.count('[相关度'))
+                logger.info("📌 已召回 %d 条相关历史", recalled.count('相关度'))
 
         # 根据用户输入匹配 Skills，动态重建系统提示词
         skills_ctx = ""
@@ -102,8 +109,15 @@ class Agent:
         # 重建系统提示词（含召回的历史 + 技能）
         self._build_system_prompt(skills_ctx, recalled)
 
-        # 添加用户消息
-        self.history.append(Message(role=Role.USER, content=user_input))
+        # ── 策略一：三明治注入 ──
+        # 将 L1 规则追加到用户消息末尾（紧贴 LLM 生成起始点）
+        # 利用 LLM 近因效应（Recency Bias）最大化规则服从度
+        from core.prompt import build_l1_user_suffix
+        l1_suffix = build_l1_user_suffix(user_input)
+        augmented_input = user_input + l1_suffix if l1_suffix else user_input
+
+        # 添加用户消息（含 L1 后缀）
+        self.history.append(Message(role=Role.USER, content=augmented_input))
         self.state = AgentState.THINKING
 
         if self.verbose:
@@ -140,6 +154,14 @@ class Agent:
             if not response.tool_calls:
                 self.state = AgentState.FINISHED
                 final_answer = response.content or "(Agent 没有给出回答)"
+
+                # ── L1 规则后校验：自动检测并修正违规行为 ──
+                l1_check = self._post_validate_l1()
+                if l1_check:
+                    final_answer += f"\n\n{l1_check}"
+                    if self.verbose:
+                        logger.info("🛡️ L1 后校验触发: %s", l1_check)
+
                 if self.verbose:
                     logger.info("\n✅ Agent 回答:\n%s", final_answer)
                 # 自动保存本轮操作到记忆（含向量存储）
@@ -512,6 +534,71 @@ class Agent:
                 output=error_obs,
                 success=False,
             )
+
+    # ─────────────────────────────────────────────
+    # L1 核心规则后校验器
+    # ─────────────────────────────────────────────
+
+    def _post_validate_l1(self) -> str:
+        """
+        L1 规则后校验：在 Agent 生成最终回答后，检查是否违反了核心规则。
+
+        与 prompt 注入不同，这是代码级别的硬保障：
+        - 不依赖 LLM 是否"注意到"了规则
+        - 直接检查 _session_tools 里的实际行为
+        - 检测到违规时自动执行修正动作
+
+        Returns:
+            违规报告文本，如果没有违规则返回空字符串。
+        """
+        if not self._session_tools:
+            return ""
+
+        try:
+            from tools.learned_rules import _load_rules
+            rules = _load_rules()
+        except Exception:
+            return ""
+
+        if not rules:
+            return ""
+
+        used_tools = set(self._session_tools)
+        violations = []
+
+        for rule in rules:
+            rule_text = rule["rule"].lower()
+
+            # ── 模式匹配："Word进程" + "关闭" → 检查 close_word ──
+            if ("word" in rule_text and ("关闭" in rule_text or "close" in rule_text)):
+                word_used = used_tools & WORD_TOOLS
+                if word_used and "close_word" not in used_tools:
+                    # 自动修正：调用 close_word
+                    tool = self.tools.get("close_word")
+                    if tool:
+                        try:
+                            tool.execute()
+                            self._session_tools.append("close_word")
+                            violations.append(
+                                f"⚠️ [L1 后校验] 检测到使用了 Word 工具 "
+                                f"({', '.join(word_used)}) 但未关闭 Word 进程。"
+                                f"已自动执行 close_word。"
+                            )
+                            if self.verbose:
+                                logger.warning(
+                                    "  🛡️ L1 后校验：自动关闭 Word 进程"
+                                )
+                        except Exception as e:
+                            violations.append(
+                                f"⚠️ [L1 后校验] 检测到违规：使用了 Word 工具但未关闭。"
+                                f"自动修正失败: {e}"
+                            )
+
+            # ── 未来可扩展更多规则模式 ──
+            # elif "其他关键词" in rule_text:
+            #     ...
+
+        return "\n".join(violations)
 
     def _save_session(self, user_input: str = "", summary: str = ""):
         """将本轮操作记录保存到记忆（含向量存储）"""

@@ -289,6 +289,75 @@ class ListCustomToolsTool(Tool):
 
 
 # ═════════════════════════════════════════════
+# Tool 4: 否决工具（自动销毁未注册的草稿）
+# ═════════════════════════════════════════════
+
+class RejectToolTool(Tool):
+    """用户否决后销毁工具草稿（只能删除 .draft 文件，范围极窄）。"""
+
+    name = "reject_tool"
+    description = (
+        "否决并销毁一个由 create_tool 创建的工具草稿。\n"
+        "当用户审查代码后决定不通过时，调用此工具自动清理 .draft 文件。\n"
+        "安全限制：只能删除 tools/custom/ 目录下的 .draft 草稿文件，"
+        "不能删除已激活的 .py 工具。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "tool_name": {
+                "type": "string",
+                "description": "要否决的工具名称（不含 .py.draft 后缀）",
+            },
+            "reason": {
+                "type": "string",
+                "description": "可选。否决原因，会记录到日志中。",
+            },
+        },
+        "required": ["tool_name"],
+    }
+
+    def execute(self, tool_name: str, reason: str = "", **kwargs) -> str:
+        # 安全检查：防止路径穿越
+        if "/" in tool_name or "\\" in tool_name or ".." in tool_name:
+            return "❌ 工具名称包含非法字符（不允许路径分隔符）。"
+
+        draft_path = os.path.join(_TOOLS_DIR, f"{tool_name}.py.draft")
+        final_path = os.path.join(_TOOLS_DIR, f"{tool_name}.py")
+
+        # 检查是否是已激活的工具（不允许通过此工具删除）
+        if os.path.exists(final_path):
+            return (
+                f"⛔ 工具 '{tool_name}' 已经是激活状态（.py 文件），"
+                f"不能通过 reject_tool 删除已注册的工具。"
+                f"如需移除已激活工具，请手动删除文件: {final_path}"
+            )
+
+        if not os.path.exists(draft_path):
+            return f"ℹ️ 未找到工具草稿 '{tool_name}'，可能已经被清理过了。"
+
+        # 安全删除：二次验证路径确实在 _TOOLS_DIR 下
+        abs_draft = os.path.abspath(draft_path)
+        abs_tools = os.path.abspath(_TOOLS_DIR)
+        if not abs_draft.startswith(abs_tools):
+            return "❌ 路径安全检查失败，拒绝删除。"
+
+        try:
+            os.remove(draft_path)
+            reason_str = f"\n   否决原因: {reason}" if reason else ""
+            logger.info(
+                "🗑️ 工具草稿已销毁: %s%s", tool_name,
+                f" (原因: {reason})" if reason else "",
+            )
+            return (
+                f"🗑️ 工具草稿 '{tool_name}' 已销毁。{reason_str}\n"
+                f"   已删除文件: {draft_path}"
+            )
+        except Exception as e:
+            return f"❌ 删除失败: {e}"
+
+
+# ═════════════════════════════════════════════
 # 工具加载器（供 main.py 启动时使用）
 # ═════════════════════════════════════════════
 

@@ -47,7 +47,7 @@ L3_CAPACITY = 100          # L3 最大条目数
 L3_EVICT_TARGET = 80       # L3 淘汰后保留条目数
 L3_TTL_DAYS = 30           # L3 过期天数
 L2_CAPACITY = 50           # L2 最大条目数
-CONFLICT_THRESHOLD = 0.85  # 语义冲突阈值
+CONFLICT_THRESHOLD = 0.92  # 语义冲突阈值（0.85→0.92: 短中文文本天然相似度高，调高减少误杀）
 PROMOTION_THRESHOLD = 5    # L3 → L2 晋升所需召回次数
 
 
@@ -203,7 +203,8 @@ class Memory:
         if not self.embed_client or self._vector_store is None:
             return
 
-        summary = f"用户: {user_input[:200]}\nAgent: {agent_reply[:300]}"
+        # 去掉模板化前缀，减少不同对话间 embedding 的基础相似度
+        summary = f"{user_input[:200]} → {agent_reply[:300]}"
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         try:

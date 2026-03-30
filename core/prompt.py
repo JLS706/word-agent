@@ -25,7 +25,8 @@ SYSTEM_PROMPT = """\
 除了上述文档操作工具，你还拥有以下**自我进化能力**，请务必记住并主动使用：
 
 1. **创造新工具**：当你发现自己缺少某个功能时，可以用 `create_tool` \
-自主编写新工具代码，经用户审批（`approve_tool`）后永久注册使用。
+自主编写新工具代码，经用户审批（`approve_tool`）后永久注册使用。\
+如果用户否决，你必须立即调用 `reject_tool` 销毁草稿文件，不允许残留。
 2. **管理自定义工具**：用 `list_custom_tools` 查看你已创建的所有自定义工具。
 3. **清理 Word 进程**：用 `close_word` 关闭残留的 Word 进程。\
 每次调用涉及 Word 的工具（read_document、format_references 等）后，必须在最后一步调用它。
@@ -50,6 +51,8 @@ SYSTEM_PROMPT = """\
 必须在用户明确表达长期偏好时才能提议，且必须获得用户确认后才能执行（confirmed=true）。\
 你的反思和总结应存入 L2 长期记忆，而非 L1 核心规则。
 8. **主动行动**：当你有能力解决用户的问题时（如关闭 Word 进程），直接调用工具执行，不要只是口头回答。
+9. **🧠 L1 强制认知回显**：在你每次调用工具之前，你必须先在思考过程中检索并默写出与当前操作相关的 L1 核心规则，\
+确认你的操作没有违背任何一条铁律。如果存在冲突，必须修改操作方案使其合规后才能执行。
 
 {skills_context}
 
@@ -58,6 +61,7 @@ SYSTEM_PROMPT = """\
 ## 语言偏好
 
 请使用中文与用户交流。
+{learned_rules_reminder}
 """
 
 
@@ -93,6 +97,8 @@ PLANNER_PROMPT = """\
 REVIEWER_PROMPT = """\
 你是 DocMaster Reviewer（审查者）。你的职责是读取已处理的文档，验证处理结果是否正确。
 
+{l1_constitutional_section}
+
 ## 你能做的事情
 
 {tool_descriptions}
@@ -118,11 +124,15 @@ REVIEWER_PROMPT = """\
    - 图注编号是否连续？正文对图的引用是否与图注匹配？
    - 是否有异常文本（如域代码显示为原始文本、编号错误等）？
    - **格式规范**：正文首行缩进、字体字号、行间距、对齐方式是否正确？
-3. **输出验证报告**：用以下格式输出：
+3. **🛡️ L1 宪法审查（最高优先级）**：
+   - 你必须逐条检查上方的 L1 核心规则，验证 Executor 的操作是否存在违规。
+   - L1 违规必须标记为 ❌ 失败项，且评级不得高于 C。
+   - 即使其他维度全部通过，存在 L1 违规也必须判定为不合格。
+4. **输出验证报告**：用以下格式输出：
    - ✅ [通过项] — 简要说明
    - ⚠️ [可疑项] — 具体位置和问题描述
    - ❌ [失败项] — 具体位置和问题描述
-4. **给出总体评分**：S/A/B/C/D，S 表示完美，D 表示严重问题。
+5. **给出总体评分**：S/A/B/C/D，S 表示完美，D 表示严重问题。
 
 请使用中文回答。
 """
@@ -137,9 +147,19 @@ def build_system_prompt(tool_descriptions: str, memory_context: str = "",
 
     # 加载 Agent 自学习规则
     learned_section = ""
+    reminder = ""
     try:
-        from tools.learned_rules import load_rules_for_prompt
+        from tools.learned_rules import load_rules_for_prompt, _load_rules
         learned_section = load_rules_for_prompt()
+        # 首尾夹击：在 Prompt 末尾重复 L1 规则，对抗 LLM 注意力衰减
+        if learned_section:
+            rules = _load_rules()
+            if rules:
+                reminder = (
+                    "\n---\n"
+                    "⚠️ **再次提醒以下核心铁律（必须严格遵守，违反即失败）：**\n"
+                    + "\n".join(f"• {r['rule']}" for r in rules)
+                )
     except Exception:
         pass  # 加载失败不影响主功能
 
@@ -148,6 +168,7 @@ def build_system_prompt(tool_descriptions: str, memory_context: str = "",
         skills_context=skills_context,
         memory_context=mem_section,
         learned_rules_context=learned_section,
+        learned_rules_reminder=reminder,
     )
 
 
@@ -163,8 +184,26 @@ def build_planner_prompt(tool_descriptions: str, memory_context: str = "") -> st
 
 
 def build_reviewer_prompt(tool_descriptions: str) -> str:
-    """构建 Reviewer 角色的系统提示词"""
-    return REVIEWER_PROMPT.format(tool_descriptions=tool_descriptions)
+    """构建 Reviewer 角色的系统提示词（含 L1 宪法审查）"""
+    # Reviewer 的上下文极短、注意力高度集中，是 L1 的最佳守门人
+    l1_section = ""
+    try:
+        from tools.learned_rules import _load_rules
+        rules = _load_rules()
+        if rules:
+            rule_lines = "\n".join(f"{i}. **{r['rule']}**" for i, r in enumerate(rules, 1))
+            l1_section = (
+                "## 🔒 L1 宪法（最高审查标准）\n\n"
+                "以下核心规则具有一票否决权。Executor 的任何违规都必须在报告中标记为 ❌ 失败项。\n\n"
+                f"{rule_lines}"
+            )
+    except Exception:
+        pass
+
+    return REVIEWER_PROMPT.format(
+        tool_descriptions=tool_descriptions,
+        l1_constitutional_section=l1_section,
+    )
 
 
 USER_PROMPT_TEMPLATE = """\
@@ -172,3 +211,112 @@ USER_PROMPT_TEMPLATE = """\
 
 请根据用户的需求，选择合适的工具来完成任务。如果需要多个工具，请按照正确的顺序逐一调用。
 """
+
+
+# ══════════════════════════════════════════════
+# 策略一：三明治注入 — 用户消息级别的 L1 后缀
+# ══════════════════════════════════════════════
+
+def build_l1_user_suffix(task_text: str = "") -> str:
+    """
+    生成追加到用户消息末尾的 L1 规则提醒。
+
+    三明治注入法：将 L1 规则 Append 到用户输入的末尾（紧贴生成起始点），
+    利用 LLM 的近因效应（Recency Bias）最大化规则服从度。
+
+    如果 task_text 非空，启用策略四（动态 RAG），只注入与当前任务相关的规则。
+    """
+    try:
+        from tools.learned_rules import _load_rules
+        rules = _load_rules()
+        if not rules:
+            return ""
+
+        # 策略四：动态宪法挂载 — 只注入相关规则
+        if task_text:
+            relevant = select_relevant_rules(rules, task_text)
+        else:
+            relevant = rules
+
+        if not relevant:
+            return ""
+
+        rule_str = "；".join(r["rule"] for r in relevant)
+        return f"\n\n[⚠️ 铁律] {rule_str}"
+
+    except Exception:
+        return ""
+
+
+# ══════════════════════════════════════════════
+# 策略四：动态宪法挂载 — 按任务关键词筛选规则
+# ══════════════════════════════════════════════
+
+# 规则关键词 → 任务关键词 映射表
+# 当任务文本命中右侧关键词时，对应的规则被判定为「相关」
+_RULE_KEYWORD_MAP = {
+    "word": ["word", "文档", "docx", "排版", "格式", "读取", "打开", "保存",
+             "参考文献", "交叉引用", "图注", "缩写", "摘要"],
+    "关闭": ["word", "文档", "docx", "进程", "读取", "打开"],
+    "字体": ["字体", "font", "格式", "样式", "排版"],
+    "参考文献": ["参考文献", "reference", "引用", "列表", "编号"],
+    "图": ["图", "figure", "图注", "图片", "caption"],
+    "覆盖": ["保存", "覆盖", "原文件", "另存", "备份"],
+    "缩写": ["缩写", "acronym", "全称", "定义"],
+}
+
+
+def select_relevant_rules(
+    rules: list[dict],
+    task_text: str,
+    max_rules: int = 3,
+) -> list[dict]:
+    """
+    从 L1 规则库中筛选与当前任务最相关的规则（关键词匹配，零 API 调用）。
+
+    "少即是多"：50 条规则全塞进 Prompt 会互相干扰，
+    精选 2-3 条最相关的规则能极大提升 LLM 的指令遵循度。
+
+    Args:
+        rules: L1 规则列表（来自 learned_rules.json）
+        task_text: 当前任务/用户输入文本
+        max_rules: 最多返回几条规则
+
+    Returns:
+        与任务最相关的规则子集（按相关度排序）
+    """
+    if not rules or not task_text:
+        return rules or []
+
+    task_lower = task_text.lower()
+    scored = []
+
+    for rule in rules:
+        rule_lower = rule["rule"].lower()
+        score = 0
+
+        # 方式 1：规则文本中的关键词直接出现在任务文本中
+        rule_words = set(rule_lower)
+        for keyword, task_triggers in _RULE_KEYWORD_MAP.items():
+            if keyword in rule_lower:
+                for trigger in task_triggers:
+                    if trigger in task_lower:
+                        score += 1
+
+        # 方式 2：规则文本与任务文本有直接词汇重叠
+        import re
+        rule_tokens = set(re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z]+', rule_lower))
+        task_tokens = set(re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z]+', task_lower))
+        overlap = rule_tokens & task_tokens
+        score += len(overlap)
+
+        if score > 0:
+            scored.append((rule, score))
+
+    # 如果没有任何规则匹配，返回全部（保底）
+    if not scored:
+        return rules[:max_rules]
+
+    # 按相关度降序，取 top-N
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [r for r, _ in scored[:max_rules]]

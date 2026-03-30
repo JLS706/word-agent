@@ -81,7 +81,7 @@ def create_agent(config: dict, dry_run: bool = False):
     from tools.word_cleanup import CloseWordTool
     from tools.pipeline_tool import RunPipelineTool, set_orchestrator
     from tools.tool_creator import (
-        CreateToolTool, ApproveToolTool, ListCustomToolsTool,
+        CreateToolTool, ApproveToolTool, RejectToolTool, ListCustomToolsTool,
         load_custom_tools,
     )
 
@@ -128,6 +128,7 @@ def create_agent(config: dict, dry_run: bool = False):
     registry.register(SummarizeDocumentTool())         # 全文摘要(Map-Reduce)
     registry.register(CreateToolTool())               # 动态工具创建
     registry.register(ApproveToolTool(registry))      # 工具审批激活
+    registry.register(RejectToolTool())                # 工具否决销毁
     registry.register(ListCustomToolsTool())          # 列出自定义工具
     registry.register(RunPipelineTool())               # Multi-Agent 流水线触发
 
