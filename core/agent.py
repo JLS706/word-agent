@@ -49,7 +49,8 @@ class Agent:
         self._session_tools: list[str] = []   # 本轮执行过的工具名
         self._session_file: str = ""           # 本轮操作的文件路径
         self._retry_counts: dict[str, int] = {}  # 工具重试计数器
-        self._compress_threshold = 10  # history 消息数超过此值时触发压缩
+        self._token_warning = 4000   # Token 水位：触发规则压缩
+        self._token_critical = 6000  # Token 水位：触发 LLM 深度压缩
 
         # 构建基础系统提示词（无技能上下文，启动时用）
         self._build_system_prompt()
@@ -116,8 +117,8 @@ class Agent:
             if self.verbose:
                 logger.info("\n--- 第 %d/%d 步 ---", step, self.max_steps)
 
-            # ── Scratchpad 压缩：防止 history 擑爆 Prompt ──
-            if len(self.history) > self._compress_threshold:
+            # ── Token 水位线压缩：防止上下文爆炸 ──
+            if self._estimate_tokens() > self._token_warning:
                 self._compress_history()
 
             # 调用 LLM
@@ -167,50 +168,104 @@ class Agent:
         return timeout_msg
 
     # ─────────────────────────────────────────────
-    # Scratchpad 压缩（防止 Token 爆炸）
+    # Hook 2: Token 水位线驱动的上下文压缩
     # ─────────────────────────────────────────────
+
+    def _estimate_tokens(self) -> int:
+        """
+        估算当前 history 的 Token 数（中英文混合近似）。
+
+        规则: len(text) // 2 对中英混合文本误差 ±20%。
+        不引入 tiktoken 依赖，保持零额外依赖。
+        """
+        total = 0
+        for msg in self.history:
+            text = msg.content or ""
+            total += len(text) // 2
+            if msg.tool_calls:
+                for tc in msg.tool_calls:
+                    total += len(str(tc.arguments)) // 2
+        return total
 
     def _compress_history(self):
         """
-        当 history 超过阈值时，压缩旧的工具交互为一句 Scratchpad。
+        Token 水位线驱动的两级压缩。
 
-        压缩前: [System, User, LLM₁, Tool₁, LLM₂, Tool₂, ..., LLM₇, Tool₇]
-        压缩后: [System, User, Scratchpad("已完成: ..."), LLM₆, Tool₆, LLM₇, Tool₇]
-                                ↑ 一句话概括          ↑ 只保留最近 2 轮
+        Tier 1 (token < _token_critical): 纯规则截取（零 LLM 成本）
+        Tier 2 (token ≥ _token_critical): 调 LLM 做智能摘要
+
+        压缩前: [System, User, LLM₁, Tool₁, ..., LLM₇, Tool₇]
+        压缩后: [System, User, Scratchpad, LLM₆, Tool₆, LLM₇, Tool₇]
         """
-        # 保留: System(0) + User(1) + 最近 4 条消息
+        tokens = self._estimate_tokens()
+
+        if tokens < self._token_warning:
+            return
+
         keep_head = 2  # System + User
-        keep_tail = 4  # 最近 2 轮工具交互 (LLM+Tool × 2)
+        keep_tail = 4  # 最近 2 轮工具交互
 
         if len(self.history) <= keep_head + keep_tail:
-            return  # 不够压缩
+            return
 
-        # 提取要压缩的中间部分
         middle = self.history[keep_head:-keep_tail]
         if not middle:
             return
 
-        # 从中间部分提取工具调用摘要（不调 LLM，纯规则提取）
-        tool_summaries = []
-        for msg in middle:
-            if msg.role == Role.TOOL:
-                # 截取工具结果的第一行作为摘要
-                first_line = (msg.content or "").split("\n")[0][:80]
-                tool_name = msg.name or "unknown"
-                tool_summaries.append(f"{tool_name}: {first_line}")
+        if tokens < self._token_critical:
+            # ── Tier 1: 规则压缩（零成本）──
+            tool_summaries = []
+            for msg in middle:
+                if msg.role == Role.TOOL:
+                    first_line = (msg.content or "").split("\n")[0][:80]
+                    tool_name = msg.name or "unknown"
+                    tool_summaries.append(f"{tool_name}: {first_line}")
 
-        scratchpad_text = (
-            "[已完成步骤摘要] "
-            + "; ".join(tool_summaries) if tool_summaries
-            else "[已完成若干步骤]"
-        )
+            scratchpad_text = (
+                "[已完成步骤] "
+                + "; ".join(tool_summaries) if tool_summaries
+                else "[已完成若干步骤]"
+            )
+        else:
+            # ── Tier 2: LLM 深度压缩 ──
+            middle_text = "\n".join(
+                f"[{msg.role.value}] {(msg.content or '')[:200]}"
+                for msg in middle
+            )
+            try:
+                compress_msgs = [
+                    Message(
+                        role=Role.SYSTEM,
+                        content=(
+                            "将以下 Agent 执行过程压缩为 3 句话，"
+                            "保留关键操作和结论，去除冗余细节。"
+                        ),
+                    ),
+                    Message(
+                        role=Role.USER,
+                        content=middle_text[:2000],
+                    ),
+                ]
+                resp = self.llm.chat(compress_msgs)
+                scratchpad_text = (
+                    f"[压缩摘要] {resp.content or '(压缩失败)'}"
+                )
+                if self.verbose:
+                    logger.debug(
+                        "  📋 Tier2 LLM 深度压缩: %d Token → ~%d Token",
+                        tokens,
+                        self._estimate_tokens(),
+                    )
+            except Exception:
+                # LLM 失败时回退到规则压缩
+                scratchpad_text = "[已完成若干步骤，因上下文过长已压缩]"
 
         scratchpad_msg = Message(
             role=Role.ASSISTANT,
             content=scratchpad_text,
         )
 
-        # 重组 history: 头部 + Scratchpad + 尾部
+        old_len = len(self.history)
         self.history = (
             self.history[:keep_head]
             + [scratchpad_msg]
@@ -219,9 +274,8 @@ class Agent:
 
         if self.verbose:
             logger.debug(
-                "  📋 Scratchpad 压缩: %d 条消息 → %d 条",
-                keep_head + len(middle) + keep_tail,
-                len(self.history),
+                "  📋 Token 水位压缩: %d 条消息 → %d 条 (≈%d tokens)",
+                old_len, len(self.history), self._estimate_tokens(),
             )
 
     # ─────────────────────────────────────────────

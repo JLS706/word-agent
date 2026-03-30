@@ -139,6 +139,52 @@ class MultiAgentOrchestrator:
 
         return True, ""
 
+    # ─────────────────────────────────────────────
+    # Hook 1: 子任务完结反思 (Task Completion Reflection)
+    # ─────────────────────────────────────────────
+
+    def _reflect_on_step(self, step: dict, result: str):
+        """
+        子任务完结时提炼经验，存入 L2 长期记忆。
+
+        成本控制：
+          - result < 200 字符（执行顺利）→ 跳过
+          - LLM 回复"无" → 不存储
+          - 反思失败不影响主流程
+        """
+        # 执行顺利无波折，跳过反思
+        if len(result) < 200:
+            return
+
+        if not self.memory or not self.memory.embed_client:
+            return
+
+        try:
+            messages = [
+                Message(role=Role.SYSTEM, content=(
+                    "你是经验提取器。将以下工具执行日志压缩为一条不超过50字的经验总结，"
+                    "重点提取遇到的报错及有效的解决方法。"
+                    "如果执行顺利无特殊情况，只回复'无'。"
+                )),
+                Message(role=Role.USER, content=(
+                    f"步骤: {step['desc']}\n执行日志:\n{result[:800]}"
+                )),
+            ]
+            response = self.llm.chat(messages)
+            experience = (response.content or "").strip()
+
+            # "无" 或太短的回复直接丢弃
+            if not experience or experience == "无" or len(experience) < 5:
+                return
+
+            # 存入 L2 长期记忆
+            self.memory.add_reflection(experience)
+            if self.verbose:
+                logger.info("  [Reflection] 💡 %s", experience)
+
+        except Exception as e:
+            logger.warning("  [Reflection] 反思失败(不影响主流程): %s", e)
+
     def run_pipeline(self, file_path: str) -> str:
         """Run pipeline with checkpoint save/resume support."""
         task_id = self._make_task_id(file_path)
@@ -589,6 +635,11 @@ class MultiAgentOrchestrator:
                 completed_steps.append(step_desc)
                 step_results.append(f"Step {step['index']}: {step_desc}\n{result}")
                 i += 1
+                # Hook 1: 子任务完结反思（在 Checkpoint 前提炼经验）
+                try:
+                    self._reflect_on_step(step, result)
+                except Exception as e:
+                    logger.warning("  [Reflection] 反思异常(不影响主流程): %s", e)
                 # Checkpoint after each successful step
                 if state and self.checkpointer and task_id:
                     state.completed_steps = completed_steps

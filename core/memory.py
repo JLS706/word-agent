@@ -1,12 +1,33 @@
 # -*- coding: utf-8 -*-
 """
-DocMaster Agent - 本地记忆系统
-将用户的操作历史和偏好保存到本地 JSON 文件中，实现跨会话记忆。
+DocMaster Agent - 三级分层记忆系统 (Hierarchical Memory)
 
-v2: 新增向量记忆（RAG 式对话召回）
-  - 每轮对话结束后，将 Q+A 摘要存入向量库
-  - 新对话开始时，用用户问题作为 query 检索最相关的历史片段
-  - 复用 core/embeddings.py 的 VectorStore，无需外部向量数据库
+v3: 三级分层架构
+
+  L1: Core Memory (核心规则库)
+      载体: learned_rules.json（由 learned_rules 工具管理）
+      特点: 永不压缩、永不过期、最高执行权重
+
+  L2: Long-term RAG (长期向量记忆)
+      载体: memory_vectors.json (type=reflection)
+      来源: 子任务反思归纳 / L3 晋升
+      淘汰: FIFO 上限 50 条，绝不二次压缩
+
+  L3: Short-term Conversation (短期对话记忆)
+      载体: memory_vectors.json (type=conversation)
+      来源: 每轮对话的 Q+A 摘要
+      淘汰: 30天 TTL + 召回率末尾淘汰
+      晋升: recall_count ≥ 5 → 自动提升到 L2
+
+  Working Memory (工作记忆):
+      载体: agent.py 的 self.history（内存，非持久化）
+      压缩: Token 水位线驱动（见 agent.py）
+
+层感知语义冲突规则:
+  L3 → L3: 同层替换 ✅
+  L2 → L2: 同层替换 ✅
+  L3 → L2: 不动 L2 ❌（低层不覆盖高层）
+  L2 → L3: 清理相似 L3 🗑️（高层替代低层冗余）
 """
 
 import json
@@ -18,8 +39,20 @@ from typing import Optional
 from core.logger import logger
 
 
+# ─────────────────────────────────────────────
+# 配置常量
+# ─────────────────────────────────────────────
+
+L3_CAPACITY = 100          # L3 最大条目数
+L3_EVICT_TARGET = 80       # L3 淘汰后保留条目数
+L3_TTL_DAYS = 30           # L3 过期天数
+L2_CAPACITY = 50           # L2 最大条目数
+CONFLICT_THRESHOLD = 0.85  # 语义冲突阈值
+PROMOTION_THRESHOLD = 5    # L3 → L2 晋升所需召回次数
+
+
 class Memory:
-    """本地记忆管理器（含向量召回）"""
+    """三级分层记忆管理器"""
 
     def __init__(self, memory_dir: str = "memory", embed_client=None):
         self.memory_dir = os.path.abspath(memory_dir)
@@ -28,7 +61,7 @@ class Memory:
 
         # ── 向量记忆 ──
         self.embed_client = embed_client
-        self._vector_store = None          # 延迟初始化
+        self._vector_store = None
         self._vector_cache_path = os.path.join(self.memory_dir, "memory_vectors.json")
         self._load_vector_store()
 
@@ -41,11 +74,32 @@ class Memory:
             cached = VectorStore.load_cache(self._vector_cache_path)
             if cached:
                 self._vector_store = cached
+                # 兼容旧数据：补全缺失的 metadata 字段
+                self._migrate_metadata()
             else:
                 self._vector_store = VectorStore()
         except Exception:
             from core.embeddings import VectorStore
             self._vector_store = VectorStore()
+
+    def _migrate_metadata(self):
+        """兼容旧版数据：为缺少 type/recall_count 的条目补全默认值"""
+        if self._vector_store is None:
+            return
+        changed = False
+        for i, meta in enumerate(self._vector_store.metadata):
+            if "type" not in meta:
+                meta["type"] = "conversation"
+                changed = True
+            if "recall_count" not in meta:
+                meta["recall_count"] = 0
+                changed = True
+            if "last_recalled" not in meta:
+                meta["last_recalled"] = None
+                changed = True
+        if changed:
+            self._vector_store.save_cache(self._vector_cache_path)
+            logger.debug("  [Memory] 已迁移旧版 metadata 到分层格式")
 
     def _load(self) -> dict:
         """从 JSON 文件加载记忆"""
@@ -63,6 +117,10 @@ class Memory:
         with open(self.history_file, "w", encoding="utf-8") as f:
             json.dump(self._data, f, ensure_ascii=False, indent=2)
 
+    # ─────────────────────────────────────────────
+    # 操作历史（不变）
+    # ─────────────────────────────────────────────
+
     def add_session(self, file_path: str, actions: list[str], summary: str):
         """记录一次操作会话"""
         session = {
@@ -72,7 +130,6 @@ class Memory:
             "summary": summary,
         }
         self._data["sessions"].append(session)
-        # 只保留最近 50 条记录
         if len(self._data["sessions"]) > 50:
             self._data["sessions"] = self._data["sessions"][-50:]
         self._save()
@@ -105,13 +162,11 @@ class Memory:
 
         lines = []
 
-        # 向量召回的相关历史（RAG 式）
         if recalled_context:
             lines.append("📌 与当前问题最相关的历史对话：\n")
             lines.append(recalled_context)
             lines.append("")
 
-        # 最近操作记录（原有逻辑）
         if recent:
             lines.append("最近操作记录：")
             for s in recent:
@@ -133,27 +188,28 @@ class Memory:
             result += "\n\n用户偏好：\n" + "\n".join(pref_lines)
         return result
 
-    # ─────────────────────────────────────────────
-    # 向量记忆（RAG 式对话召回）
-    # ─────────────────────────────────────────────
+    # ═════════════════════════════════════════════
+    # L3: Short-term Conversation (短期对话记忆)
+    # ═════════════════════════════════════════════
 
-    def add_to_vector(self, user_input: str, agent_reply: str):
+    def add_conversation(self, user_input: str, agent_reply: str):
         """
-        将一轮对话存入向量记忆（含矛盾消解）。
+        将一轮对话存入 L3 短期记忆（含层感知语义冲突消解）。
 
-        改进：存入前检测语义冲突 —— 如果新记忆与某条旧记忆
-        相似度 > 0.85，说明是同一话题的更新，用新记忆替换旧的，
-        避免"喜欢苹果"和"不喜欢苹果"同时存在。
+        冲突规则:
+          - 与 L3 冲突 (>0.85): 替换旧 L3（同层覆盖）
+          - 与 L2 冲突 (>0.85): 不动 L2，L3 正常存入（低层不覆盖高层）
         """
         if not self.embed_client or self._vector_store is None:
             return
 
         summary = f"用户: {user_input[:200]}\nAgent: {agent_reply[:300]}"
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         try:
             embedding = self.embed_client.embed(summary)
 
-            # ── 矛盾消解：检测是否与旧记忆冲突 ──
+            # ── 层感知语义冲突消解 ──
             if len(self._vector_store) > 0:
                 from core.embeddings import cosine_similarity
                 import numpy as np
@@ -162,116 +218,81 @@ class Memory:
                     score = cosine_similarity(
                         query_vec, self._vector_store.embeddings[i]
                     )
-                    if score > 0.85:  # 语义高度重合 → 替换旧记忆
-                        logger.debug(
-                            "  [Memory] 检测到语义冲突(%.1f%%)，替换旧记忆",
-                            score * 100,
+                    if score > CONFLICT_THRESHOLD:
+                        old_type = self._vector_store.metadata[i].get(
+                            "type", "conversation"
                         )
-                        self._vector_store.chunks[i] = summary
-                        self._vector_store.embeddings[i] = query_vec
-                        self._vector_store.metadata[i] = {
-                            "time": datetime.now().strftime("%Y-%m-%d %H:%M")
-                        }
-                        self._vector_store.save_cache(self._vector_cache_path)
-                        return
+                        if old_type == "conversation":
+                            # L3 → L3: 同层替换
+                            logger.debug(
+                                "  [Memory] L3 语义冲突(%.1f%%)，替换旧 L3",
+                                score * 100,
+                            )
+                            self._vector_store.chunks[i] = summary
+                            self._vector_store.embeddings[i] = query_vec
+                            self._vector_store.metadata[i] = {
+                                "type": "conversation",
+                                "time": now_str,
+                                "recall_count": 0,
+                                "last_recalled": None,
+                            }
+                            self._vector_store.save_cache(
+                                self._vector_cache_path
+                            )
+                            return
+                        elif old_type == "reflection":
+                            # L3 → L2: 不动 L2，L3 正常存入
+                            logger.debug(
+                                "  [Memory] L3 与 L2 语义相似(%.1f%%)，"
+                                "L2 不动，L3 正常存入",
+                                score * 100,
+                            )
+                            # 不 return，继续往下正常追加
 
-            # 无冲突 → 正常追加
-            metadata = [{"time": datetime.now().strftime("%Y-%m-%d %H:%M")}]
+            # 无冲突 / 跨层不覆盖 → 正常追加
+            metadata = [{
+                "type": "conversation",
+                "time": now_str,
+                "recall_count": 0,
+                "last_recalled": None,
+            }]
             self._vector_store.add([summary], [embedding], metadata)
             self._vector_store.save_cache(self._vector_cache_path)
 
-            # ── 反思压缩：记忆太多时触发归纳 ──
-            if len(self._vector_store) > 100:
-                self._reflect_and_compress()
+            # ── 淘汰检查 ──
+            self._evict_expired()
 
         except Exception as e:
-            logger.warning("  [Memory] 向量存储失败(不影响主功能): %s", e)
+            logger.warning("  [Memory] L3 存储失败(不影响主功能): %s", e)
 
-    def recall_relevant(self, query: str, top_k: int = 3,
-                        min_score: float = 0.45) -> str:
+    def add_to_vector(self, user_input: str, agent_reply: str):
+        """向后兼容：代理到 add_conversation()"""
+        self.add_conversation(user_input, agent_reply)
+
+    # ═════════════════════════════════════════════
+    # L2: Long-term RAG (长期向量记忆)
+    # ═════════════════════════════════════════════
+
+    def _fuse_l2_conflict(
+        self, old_text: str, new_text: str
+    ) -> tuple[str, str]:
         """
-        根据当前问题，召回最相关的历史对话片段（含时间衰减）。
+        L2 冲突融合节点：判断冲突类型并执行相应策略。
 
-        改进：最终得分 = 0.7 × 语义相似度 + 0.3 × 时间新鲜度
-        时间新鲜度使用指数衰减：recency = exp(-days / 30)
-        即 1 天前≈0.97，7天前≈0.79，30 天前≈0.37
+        当新 L2 经验与旧 L2 经验 cosine > 0.85 时触发。
+        调用 LLM 判断是"冲突覆写"还是"细节补充"：
+          - REPLACE: 新旧矛盾，用新的替换旧的
+          - MERGE:   新旧互补，融合为一条更完整的经验
+
+        Args:
+            old_text: 已存在的 L2 经验
+            new_text: 新传入的 L2 经验
+
+        Returns:
+            (action, result_text)
+            action: "replace" | "merge"
+            result_text: 最终要写入的经验文本
         """
-        if (not self.embed_client or self._vector_store is None
-                or len(self._vector_store) == 0):
-            return ""
-
-        try:
-            query_embedding = self.embed_client.embed(query)
-            # 取更多候选用于重评分
-            candidates = self._vector_store.search(
-                query_embedding, top_k=top_k * 3
-            )
-
-            if not candidates:
-                return ""
-
-            # ── 时间衰减重评分 ──
-            now = datetime.now()
-            scored = []
-            for r in candidates:
-                semantic = r["score"]
-                # 计算时间新鲜度
-                recency = 0.5  # 默认值（无时间信息时）
-                time_str = r.get("metadata", {}).get("time", "")
-                if time_str:
-                    try:
-                        mem_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
-                        days_ago = (now - mem_time).total_seconds() / 86400
-                        recency = math.exp(-days_ago / 30)  # 30天半衰期
-                    except ValueError:
-                        pass
-
-                final_score = 0.7 * semantic + 0.3 * recency
-                scored.append({**r, "final_score": final_score})
-
-            # 按混合得分排序，取 top_k
-            scored.sort(key=lambda x: x["final_score"], reverse=True)
-            relevant = [
-                r for r in scored[:top_k]
-                if r["final_score"] >= min_score
-            ]
-
-            if not relevant:
-                return ""
-
-            parts = []
-            for i, r in enumerate(relevant, 1):
-                score_pct = round(r["final_score"] * 100, 1)
-                parts.append(f"[相关度 {score_pct}%] {r['chunk']}")
-
-            return "\n\n".join(parts)
-        except Exception as e:
-            logger.warning("  [Memory] 向量召回失败(不影响主功能): %s", e)
-            return ""
-
-    # ─────────────────────────────────────────────
-    # 反思压缩（Reflection）
-    # ─────────────────────────────────────────────
-
-    def _reflect_and_compress(self):
-        """
-        当向量记忆超过阈值时，压缩旧记忆为高层级认知。
-
-        机制（受 Generative Agents / Smallville 启发）：
-          1. 取最旧的 50 条记忆
-          2. 让 LLM 归纳为 ~5 条长期认知
-          3. 用归纳结果替换原始 50 条 → 记忆数量从 100+ 缩减
-        """
-        if self._vector_store is None or len(self._vector_store) <= 100:
-            return
-
-        logger.info("  [Memory] 反思压缩：%d 条记忆超过阈值，归纳旧记忆...",
-                    len(self._vector_store))
-
-        # 取最旧的 50 条
-        old_texts = self._vector_store.chunks[:50]
-        combined = "\n".join(f"- {t}" for t in old_texts)
-
         try:
             import toml
             from core.llm import LLM
@@ -286,50 +307,415 @@ class Memory:
 
             messages = [
                 Message(role=Role.SYSTEM, content=(
-                    "你是一个记忆管理助手。以下是用户与 AI 助手的多轮历史对话摘要。"
-                    "请将它们归纳为 5 条简洁的长期记忆，保留关键偏好、"
-                    "常用操作模式和重要结论。每条一行，用 '- ' 开头。"
+                    "你是记忆融合判断器。给定一条旧经验和一条新经验，判断关系：\n"
+                    "- 如果新经验与旧经验矛盾（结论相反），回复第一行: REPLACE\n"
+                    "- 如果新经验是旧经验的补充（增加细节/条件），回复第一行: MERGE\n"
+                    "\n"
+                    "如果是 MERGE，第二行写出融合后的完整经验（不超过80字，"
+                    "保留两者的关键信息）。\n"
+                    "如果是 REPLACE，第二行写出新经验即可。"
                 )),
-                Message(role=Role.USER, content=f"历史对话：\n{combined}"),
+                Message(role=Role.USER, content=(
+                    f"旧经验: {old_text}\n新经验: {new_text}"
+                )),
             ]
             response = llm.chat(messages)
-            insights = response.content or ""
+            reply = (response.content or "").strip()
 
-            # 解析归纳结果
-            insight_lines = [
-                line.strip().lstrip("- ").strip()
-                for line in insights.split("\n")
-                if line.strip().startswith("- ")
-            ]
-            if not insight_lines:
-                return  # 归纳失败，不动原始数据
+            lines = reply.split("\n", 1)
+            action_line = lines[0].strip().upper()
+            result_line = lines[1].strip() if len(lines) > 1 else new_text
 
-            # 为归纳结果生成 Embedding
-            new_embeddings = self.embed_client.embed_batch(insight_lines)
-            new_metadata = [
-                {"time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                 "type": "reflection"}
-                for _ in insight_lines
-            ]
+            if "MERGE" in action_line and result_line:
+                logger.info(
+                    "  [Memory] L2 融合: '%s' + '%s' → '%s'",
+                    old_text[:30], new_text[:30], result_line[:50],
+                )
+                return "merge", result_line
+            else:
+                logger.info(
+                    "  [Memory] L2 覆写: '%s' → '%s'",
+                    old_text[:30], new_text[:30],
+                )
+                return "replace", new_text
 
-            # 删除旧的 50 条，插入归纳结果
-            import numpy as np
-            self._vector_store.chunks = (
-                insight_lines + self._vector_store.chunks[50:]
+        except Exception as e:
+            # LLM 不可用时，回退为简单替换（保守策略）
+            logger.warning(
+                "  [Memory] L2 融合判断失败(%s)，回退为替换", e
             )
-            self._vector_store.embeddings = np.vstack([
-                np.array(new_embeddings),
-                self._vector_store.embeddings[50:],
-            ])
-            self._vector_store.metadata = (
-                new_metadata + self._vector_store.metadata[50:]
+            return "replace", new_text
+
+    def add_reflection(self, experience_text: str):
+        """
+        将反思经验存入 L2 长期记忆（含层感知冲突消解）。
+
+        冲突规则:
+          - 与 L2 冲突 (>0.85): 替换旧 L2（同层覆盖）
+          - 与 L3 冲突 (>0.85): 清理相似 L3（高层替代低层冗余）
+        """
+        if not self.embed_client or self._vector_store is None:
+            return
+
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        try:
+            embedding = self.embed_client.embed(experience_text)
+
+            # ── 层感知冲突消解 ──
+            l3_to_delete = []  # 要清理的 L3 索引
+            if len(self._vector_store) > 0:
+                from core.embeddings import cosine_similarity
+                import numpy as np
+                query_vec = np.array(embedding)
+                for i in range(len(self._vector_store.chunks)):
+                    score = cosine_similarity(
+                        query_vec, self._vector_store.embeddings[i]
+                    )
+                    if score > CONFLICT_THRESHOLD:
+                        old_type = self._vector_store.metadata[i].get(
+                            "type", "conversation"
+                        )
+                        if old_type == "reflection":
+                            # L2 → L2: 融合节点判断
+                            old_text = self._vector_store.chunks[i]
+                            action, fused = self._fuse_l2_conflict(
+                                old_text, experience_text
+                            )
+                            # 无论 replace 还是 merge，都更新这条
+                            self._vector_store.chunks[i] = fused
+                            # merge 需要重新生成 embedding
+                            if action == "merge":
+                                fused_emb = self.embed_client.embed(fused)
+                                import numpy as np
+                                self._vector_store.embeddings[i] = np.array(
+                                    fused_emb
+                                )
+                            else:
+                                self._vector_store.embeddings[i] = query_vec
+                            self._vector_store.metadata[i] = {
+                                "type": "reflection",
+                                "time": now_str,
+                                "source": "task_completion_hook",
+                                "fused_from": action,
+                            }
+                            l2_replaced = True
+                            break
+                        elif old_type == "conversation":
+                            # L2 → L3: 标记清理
+                            logger.debug(
+                                "  [Memory] L2 替代 L3(%.1f%%)，标记清理",
+                                score * 100,
+                            )
+                            l3_to_delete.append(i)
+                else:
+                    l2_replaced = False  # noqa: F841
+
+                # 清理被 L2 替代的 L3 条目（从后往前删）
+                if l3_to_delete:
+                    self._delete_indices(l3_to_delete)
+
+                # 如果已替换了 L2，保存并返回
+                if 'l2_replaced' in dir() and l2_replaced:
+                    self._vector_store.save_cache(self._vector_cache_path)
+                    return
+
+            # 无冲突 → 正常追加 L2
+            import numpy as np
+            query_vec = np.array(embedding)
+            metadata = [{
+                "type": "reflection",
+                "time": now_str,
+                "source": "task_completion_hook",
+            }]
+            self._vector_store.add(
+                [experience_text], [embedding], metadata
             )
             self._vector_store.save_cache(self._vector_cache_path)
 
-            logger.info(
-                "  [Memory] 反思完成：50 条旧记忆 → %d 条长期认知",
-                len(insight_lines),
-            )
-        except Exception as e:
-            logger.warning("  [Memory] 反思压缩失败(不影响主功能): %s", e)
+            # ── L2 容量控制 ──
+            self._enforce_l2_cap()
 
+        except Exception as e:
+            logger.warning("  [Memory] L2 存储失败(不影响主功能): %s", e)
+
+    # ═════════════════════════════════════════════
+    # 召回（含召回追踪）
+    # ═════════════════════════════════════════════
+
+    def recall_relevant(self, query: str, top_k: int = 3,
+                        min_score: float = 0.45) -> str:
+        """
+        根据当前问题，召回最相关的历史片段（含时间衰减 + 召回追踪）。
+
+        最终得分 = 0.7 × 语义相似度 + 0.3 × 时间新鲜度
+        时间新鲜度: recency = exp(-days / 30)
+
+        副作用: 被命中的记忆 recall_count += 1, last_recalled 更新。
+        """
+        if (not self.embed_client or self._vector_store is None
+                or len(self._vector_store) == 0):
+            return ""
+
+        try:
+            query_embedding = self.embed_client.embed(query)
+            candidates = self._vector_store.search(
+                query_embedding, top_k=top_k * 3
+            )
+
+            if not candidates:
+                return ""
+
+            # ── 时间衰减重评分 ──
+            now = datetime.now()
+            scored = []
+            for r in candidates:
+                semantic = r["score"]
+                recency = 0.5
+                time_str = r.get("metadata", {}).get("time", "")
+                if time_str:
+                    try:
+                        mem_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
+                        days_ago = (now - mem_time).total_seconds() / 86400
+                        recency = math.exp(-days_ago / 30)
+                    except ValueError:
+                        pass
+
+                final_score = 0.7 * semantic + 0.3 * recency
+                scored.append({**r, "final_score": final_score})
+
+            scored.sort(key=lambda x: x["final_score"], reverse=True)
+            relevant = [
+                r for r in scored[:top_k]
+                if r["final_score"] >= min_score
+            ]
+
+            if not relevant:
+                return ""
+
+            # ── 召回追踪：更新 recall_count 和 last_recalled ──
+            now_str = now.strftime("%Y-%m-%d %H:%M")
+            tracking_changed = False
+            for r in relevant:
+                # 找到这条记忆在 vector_store 中的索引
+                try:
+                    idx = self._vector_store.chunks.index(r["chunk"])
+                    meta = self._vector_store.metadata[idx]
+                    meta["recall_count"] = meta.get("recall_count", 0) + 1
+                    meta["last_recalled"] = now_str
+                    tracking_changed = True
+                except (ValueError, IndexError):
+                    pass
+
+            if tracking_changed:
+                self._vector_store.save_cache(self._vector_cache_path)
+
+            # ── 晋升检查：高频召回的 L3 → L2 ──
+            self._check_promotion()
+
+            parts = []
+            for i, r in enumerate(relevant, 1):
+                score_pct = round(r["final_score"] * 100, 1)
+                mem_type = r.get("metadata", {}).get("type", "?")
+                label = "📝" if mem_type == "conversation" else "💡"
+                parts.append(f"[{label} 相关度 {score_pct}%] {r['chunk']}")
+
+            return "\n\n".join(parts)
+        except Exception as e:
+            logger.warning("  [Memory] 向量召回失败(不影响主功能): %s", e)
+            return ""
+
+    # ═════════════════════════════════════════════
+    # 淘汰与晋升
+    # ═════════════════════════════════════════════
+
+    def _evict_expired(self):
+        """
+        L3 淘汰：TTL 过期删除 + 召回率末尾淘汰。
+
+        触发时机：每次 add_conversation() 后。
+        策略：
+          1. TTL: age > 30天 且 recall_count == 0 → 直接删除
+          2. 容量: L3 条目 > L3_CAPACITY → 按 eviction_score 淘汰至 L3_EVICT_TARGET
+             eviction_score = recall_count × exp(-days_since_last_recall / 30)
+        """
+        if self._vector_store is None or len(self._vector_store) == 0:
+            return
+
+        now = datetime.now()
+        to_delete = []
+
+        # ── Phase 1: TTL 清理 ──
+        for i, meta in enumerate(self._vector_store.metadata):
+            if meta.get("type") != "conversation":
+                continue
+            time_str = meta.get("time", "")
+            if not time_str:
+                continue
+            try:
+                mem_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
+                age_days = (now - mem_time).total_seconds() / 86400
+                if age_days > L3_TTL_DAYS and meta.get("recall_count", 0) == 0:
+                    to_delete.append(i)
+            except ValueError:
+                pass
+
+        if to_delete:
+            logger.debug(
+                "  [Memory] TTL 淘汰 %d 条过期 L3 记忆", len(to_delete)
+            )
+            self._delete_indices(to_delete)
+
+        # ── Phase 2: 容量淘汰（召回率末尾淘汰）──
+        l3_indices = [
+            i for i, m in enumerate(self._vector_store.metadata)
+            if m.get("type") == "conversation"
+        ]
+
+        if len(l3_indices) <= L3_CAPACITY:
+            return
+
+        # 计算 eviction_score
+        eviction_scores = []
+        for i in l3_indices:
+            meta = self._vector_store.metadata[i]
+            recall_count = meta.get("recall_count", 0)
+            last_recalled = meta.get("last_recalled")
+
+            if last_recalled and recall_count > 0:
+                try:
+                    lr_time = datetime.strptime(last_recalled, "%Y-%m-%d %H:%M")
+                    days_since = (now - lr_time).total_seconds() / 86400
+                    recency = math.exp(-days_since / 30)
+                except ValueError:
+                    recency = 0.1
+            else:
+                recency = 0.01  # 从未被召回
+
+            score = recall_count * recency
+            eviction_scores.append((i, score))
+
+        # 按 eviction_score 升序排，淘汰得分最低的
+        eviction_scores.sort(key=lambda x: x[1])
+        n_to_evict = len(l3_indices) - L3_EVICT_TARGET
+        evict_indices = [idx for idx, _ in eviction_scores[:n_to_evict]]
+
+        if evict_indices:
+            logger.info(
+                "  [Memory] 召回率淘汰 %d 条 L3 记忆（容量 %d → %d）",
+                len(evict_indices), len(l3_indices), L3_EVICT_TARGET,
+            )
+            self._delete_indices(evict_indices)
+
+    def _check_promotion(self):
+        """
+        L3 → L2 晋升检查。
+
+        如果某条 L3 记忆的 recall_count >= PROMOTION_THRESHOLD，
+        将其内容存入 L2（标记 source=promotion），然后从 L3 删除。
+        """
+        if self._vector_store is None:
+            return
+
+        promoted = []
+        for i, meta in enumerate(self._vector_store.metadata):
+            if (meta.get("type") == "conversation"
+                    and meta.get("recall_count", 0) >= PROMOTION_THRESHOLD):
+                promoted.append(i)
+
+        if not promoted:
+            return
+
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        for i in promoted:
+            chunk = self._vector_store.chunks[i]
+            logger.info("  [Memory] L3 → L2 晋升（recall=%d）: %s",
+                        self._vector_store.metadata[i].get("recall_count", 0),
+                        chunk[:60])
+            # 将 L3 直接升级为 L2（原地修改 metadata）
+            self._vector_store.metadata[i] = {
+                "type": "reflection",
+                "time": now_str,
+                "source": "promotion",
+                "original_recall_count": self._vector_store.metadata[i].get(
+                    "recall_count", 0
+                ),
+            }
+
+        self._vector_store.save_cache(self._vector_cache_path)
+        self._enforce_l2_cap()
+
+    def _enforce_l2_cap(self):
+        """L2 容量控制：FIFO 删除最旧的，绝不二次压缩。"""
+        if self._vector_store is None:
+            return
+
+        l2_indices = [
+            i for i, m in enumerate(self._vector_store.metadata)
+            if m.get("type") == "reflection"
+        ]
+
+        if len(l2_indices) <= L2_CAPACITY:
+            return
+
+        # 按 time 排序，删除最旧的
+        def get_time(idx):
+            t = self._vector_store.metadata[idx].get("time", "")
+            try:
+                return datetime.strptime(t, "%Y-%m-%d %H:%M")
+            except ValueError:
+                return datetime.min
+
+        l2_indices.sort(key=get_time)
+        n_to_delete = len(l2_indices) - L2_CAPACITY
+        to_delete = l2_indices[:n_to_delete]
+
+        logger.info(
+            "  [Memory] L2 FIFO 淘汰 %d 条最旧的长期记忆", n_to_delete
+        )
+        self._delete_indices(to_delete)
+
+    # ═════════════════════════════════════════════
+    # 内部工具方法
+    # ═════════════════════════════════════════════
+
+    def _delete_indices(self, indices: list[int]):
+        """从 vector_store 中删除指定索引的条目（从后往前删，避免索引偏移）。"""
+        if not indices or self._vector_store is None:
+            return
+        import numpy as np
+
+        indices = sorted(set(indices), reverse=True)
+        for i in indices:
+            if i < len(self._vector_store.chunks):
+                del self._vector_store.chunks[i]
+                del self._vector_store.metadata[i]
+
+        # 重建 embeddings 数组
+        keep = sorted(set(range(len(self._vector_store.embeddings))) - set(indices))
+        if keep and self._vector_store.embeddings.size > 0:
+            self._vector_store.embeddings = self._vector_store.embeddings[keep]
+        else:
+            self._vector_store.embeddings = np.array([])
+
+        self._vector_store.save_cache(self._vector_cache_path)
+
+    def get_memory_stats(self) -> dict:
+        """返回记忆系统统计信息（用于调试和监控）。"""
+        if self._vector_store is None:
+            return {"total": 0, "l2_reflection": 0, "l3_conversation": 0}
+
+        l2 = sum(
+            1 for m in self._vector_store.metadata
+            if m.get("type") == "reflection"
+        )
+        l3 = sum(
+            1 for m in self._vector_store.metadata
+            if m.get("type") == "conversation"
+        )
+        return {
+            "total": len(self._vector_store),
+            "l2_reflection": l2,
+            "l3_conversation": l3,
+            "sessions": len(self._data.get("sessions", [])),
+        }

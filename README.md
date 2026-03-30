@@ -34,7 +34,10 @@
 | `execute_python` | 安全沙盒代码解释器（三层安全防护 + 进程级隔离） |
 | `create_tool` / `approve_tool` | 🧬 Agent 自主创造新工具（编写 → 沙盒测试 → 审批注册） |
 | `save/forget/list_learned_rules` | Agent 自学习系统（将经验存为规则，持续改进） |
+| 三级分层记忆 | L1 核心规则 / L2 长期反思 / L3 短期对话，含召回率淘汰 + L2 融合节点 |
 | Multi-Agent 流水线 | Planner → Executor → Reviewer 三角色协作 |
+| 子任务反思 Hook | 子任务完成后自动提炼经验存入 L2 长期记忆 |
+| Token 水位压缩 | 基于 Token 估算的两级上下文压缩（规则截取 / LLM 摘要） |
 | Skill 插件系统 | 按需加载技能手册（关键词 + Embedding 双层匹配） |
 | 多 Key 自动轮换 | API Key 失效时自动切换到下一个可用 Key |
 | 结构化错误恢复 | 三级错误分类 + 自动重试 + 引导 LLM 自修正 |
@@ -99,11 +102,11 @@ agent/
 ├── core/
 │   ├── schema.py               # 数据模型（Message, ToolCall, AgentState）
 │   ├── llm.py                  # LLM 接口封装（多 Key 自动轮换）
-│   ├── agent.py                # ReAct Agent 核心（含结构化错误恢复 + Scratchpad 压缩）
+│   ├── agent.py                # ReAct Agent 核心（Token 水位压缩 + 结构化错误恢复）
 │   ├── prompt.py               # System Prompt 模板（Executor / Planner / Reviewer）
-│   ├── memory.py               # 本地持久化记忆系统（含向量召回）
+│   ├── memory.py               # 三级分层记忆（L1核心/L2长期/L3短期 + 融合节点）
 │   ├── embeddings.py           # Embedding + 向量存储（纯 numpy 实现）
-│   ├── multi_agent.py          # Multi-Agent 流水线（含回溯修正 + Checkpoint）
+│   ├── multi_agent.py          # Multi-Agent 流水线（回溯修正 + 反思 Hook）
 │   ├── skills.py               # Skill 插件管理器（关键词 + Embedding 双层匹配）
 │   ├── sandbox.py              # 安全沙盒（三层防护 + Docker 隔离）
 │   ├── checkpoint.py           # 断点续传状态管理
@@ -132,9 +135,9 @@ agent/
 │   ├── rag_search.md           # RAG 搜索技能
 │   └── data_analysis.md        # 数据分析技能
 ├── memory/                     # 持久化存储
-│   ├── history.json            # 操作历史
-│   ├── learned_rules.json      # 自学习规则
-│   └── memory_vectors.json     # 向量记忆
+│   ├── history.json            # 操作历史（最近50条）
+│   ├── learned_rules.json      # L1 核心规则（永不过期）
+│   └── memory_vectors.json     # L2 + L3 向量记忆（含召回追踪）
 ├── sandbox/                    # Docker 沙盒微服务
 └── main.py                     # 入口
 ```
@@ -148,6 +151,8 @@ agent/
   ↓
 [Skill 匹配] "论文排版标准流" → 注入 System Prompt
   ↓
+[记忆召回] 向量搜索相关历史 → 注入上下文
+  ↓
 Agent (Think): 先用 inspect_document_format 检查格式，再处理参考文献
   ↓
 Agent (Act): inspect_document_format → 发现3处缩进问题
@@ -156,21 +161,61 @@ Agent (Act): format_references → 修复25条参考文献
   ↓
 Agent (Observe): 成功 → 继续 | 失败 → 结构化错误引导自修正
   ↓
-Agent: "已完成！发现3处格式问题，参考文献已修复25条。"
+Agent: "已完成！" → 保存 Q+A 到 L3 短期记忆
 ```
 
-### Multi-Agent 流水线（含回溯修正）
+### Multi-Agent 流水线（含回溯修正 + 反思 Hook）
 
 ```
 Phase 1 — Planner:  分析文档 → 制定执行计划 [Step1, Step2, ..., StepN]
   ↓
 Phase 2 — Executor (逐步执行 + 回溯):
-  Step 1 → 验证 ✅ → 继续
-  Step 2 → 验证 ✅ → 继续
+  Step 1 → 验证 ✅ → 💡 反思提炼经验 → 存入 L2 → Checkpoint
+  Step 2 → 验证 ✅ → 💡 反思提炼经验 → 存入 L2 → Checkpoint
   Step 3 → 验证 ❌ → 关键错误? 🚨 汇报人类
                     → 普通错误? 🔄 重试 → 🧭 重规划 → ⏩ 跳过
   ↓
 Phase 3 — Reviewer: 读取内容 + 检查格式 → 验证并输出报告（S/A/B/C/D 评分）
+```
+
+### 三级分层记忆 (Hierarchical Memory)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  L1: Core Memory (核心规则库)                                    │
+│  learned_rules.json                                             │
+│  永不压缩 · 永不过期 · System Prompt 强制注入                      │
+│  例: "工具执行后关闭Word进程"                                      │
+├─────────────────────────────────────────────────────────────────┤
+│  L2: Long-term RAG (长期向量记忆)                                 │
+│  memory_vectors.json (type=reflection)                          │
+│  来源: 子任务反思 / L3 晋升                                       │
+│  FIFO 上限 50 条 · 冲突时 LLM 融合判断(REPLACE/MERGE)             │
+│  例: "交叉引用断裂时，先转纯文本再挂书签；仍失败则删旧书签重建"        │
+├─────────────────────────────────────────────────────────────────┤
+│  L3: Short-term Conversation (短期对话记忆)                      │
+│  memory_vectors.json (type=conversation)                        │
+│  30天 TTL + 召回率末尾淘汰                                        │
+│  eviction_score = recall_count × exp(-days_since_recall / 30)   │
+│  recall_count ≥ 5 → 自动晋升到 L2                                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+冲突消解规则（层感知）：
+
+| 新记忆 \ 命中旧记忆 | L3 | L2 | L1 |
+|---|---|---|---|
+| **L3** | ✅ 同层替换 | ❌ 不动 L2 | ❌ 不动 L1 |
+| **L2** | 🗑️ 清理冗余 L3 | 🔀 LLM 融合判断 | ❌ 不动 L1 |
+
+### Token 水位线压缩 (Context Overflow Hook)
+
+```
+估算 Token ─── < 4000 ───→ 不压缩
+    │
+    ├── 4000~6000 ──→ Tier 1: 纯规则截取（零 LLM 成本）
+    │
+    └── ≥ 6000 ────→ Tier 2: LLM 智能摘要（~600 Token 成本）
 ```
 
 ### 格式感知架构（查格式 vs 查内容，职责分离）
