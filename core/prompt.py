@@ -7,8 +7,14 @@ DocMaster Agent - Prompt 模板
 # ══════════════════════════════════════════════
 # Executor — 默认的工具执行者（原有 Agent）
 # 精简版：业务规则已迁移到 skills/ 目录，按需加载
+#
+# 💡 Prompt Cache 优化（静态根 + 动态叶）：
+#   SYSTEM_PROMPT_STATIC — 跨轮次不变，可被模型厂商的 KV Cache 缓存
+#   DYNAMIC_CONTEXT_TEMPLATE — 每轮变化，作为独立消息不污染前缀缓存
 # ══════════════════════════════════════════════
-SYSTEM_PROMPT = """\
+
+# ── 静态根：内容跨轮次保持不变，Prompt Cache 友好 ──
+SYSTEM_PROMPT_STATIC = """\
 你是 DocMaster，一个专业的学术论文排版智能助手。你运行在用户的 Windows 电脑上，\
 通过 Microsoft Word COM 接口自动化操作 Word 文档。
 
@@ -54,15 +60,27 @@ SYSTEM_PROMPT = """\
 9. **🧠 L1 强制认知回显**：在你每次调用工具之前，你必须先在思考过程中检索并默写出与当前操作相关的 L1 核心规则，\
 确认你的操作没有违背任何一条铁律。如果存在冲突，必须修改操作方案使其合规后才能执行。
 
-{skills_context}
-
-{memory_context}
-
 ## 语言偏好
 
 请使用中文与用户交流。
 {learned_rules_reminder}
 """
+
+# ── 动态叶：每轮可变的上下文，作为独立消息不污染静态根的缓存 ──
+DYNAMIC_CONTEXT_TEMPLATE = """\
+## 本轮上下文
+
+以下是与当前任务相关的背景信息，请据此提供更贴心的服务：
+
+{skills_context}
+
+{memory_context}
+"""
+
+# ── 兼容别名：Planner/Reviewer 等旧调用方仍可使用 ──
+SYSTEM_PROMPT = SYSTEM_PROMPT_STATIC
+
+
 
 
 # ══════════════════════════════════════════════
@@ -138,14 +156,11 @@ REVIEWER_PROMPT = """\
 """
 
 
-def build_system_prompt(tool_descriptions: str, memory_context: str = "",
-                        skills_context: str = "") -> str:
-    """用工具描述、记忆上下文和技能上下文填充系统提示词"""
-    mem_section = ""
-    if memory_context:
-        mem_section = f"## 历史记忆\n\n以下是用户之前的操作记录，可以据此提供更贴心的服务：\n\n{memory_context}"
-
-    # 加载 Agent 自学习规则
+def _load_l1_sections() -> tuple[str, str]:
+    """
+    加载 L1 核心规则，返回 (头部注入文本, 尾部重复文本)。
+    这是一个内部辅助函数，被 build_static_system_prompt 调用。
+    """
     learned_section = ""
     reminder = ""
     try:
@@ -162,14 +177,71 @@ def build_system_prompt(tool_descriptions: str, memory_context: str = "",
                 )
     except Exception:
         pass  # 加载失败不影响主功能
+    return learned_section, reminder
 
-    return SYSTEM_PROMPT.format(
+
+def build_static_system_prompt(tool_descriptions: str) -> str:
+    """
+    构建静态系统提示词（Prompt Cache 友好）。
+
+    只包含跨轮次不变的内容：L1 规则、工具描述、行为准则。
+    不包含每轮变化的 skills/memory，它们由 build_dynamic_context() 单独提供。
+
+    💡 设计原理：
+      大模型 API 的 Prompt Cache 匹配的是 Token 序列的最长公共前缀。
+      只要这条 System Message 的内容不变，前缀就能命中缓存，
+      获得 50%~90% 的输入 Token 降价和低延迟。
+    """
+    learned_section, reminder = _load_l1_sections()
+
+    return SYSTEM_PROMPT_STATIC.format(
         tool_descriptions=tool_descriptions,
-        skills_context=skills_context,
-        memory_context=mem_section,
         learned_rules_context=learned_section,
         learned_rules_reminder=reminder,
     )
+
+
+def build_dynamic_context(skills_context: str = "",
+                          memory_context: str = "") -> str:
+    """
+    构建动态上下文（每轮可变）。
+
+    作为独立的第二条 System Message 发送，
+    不会污染 build_static_system_prompt() 的前缀缓存。
+
+    Returns:
+        格式化后的上下文文本，如果无内容则返回空字符串
+    """
+    mem_section = ""
+    if memory_context:
+        mem_section = f"### 历史记忆\n\n{memory_context}"
+
+    skills_section = ""
+    if skills_context:
+        skills_section = skills_context
+
+    if not mem_section and not skills_section:
+        return ""
+
+    return DYNAMIC_CONTEXT_TEMPLATE.format(
+        skills_context=skills_section,
+        memory_context=mem_section,
+    )
+
+
+def build_system_prompt(tool_descriptions: str, memory_context: str = "",
+                        skills_context: str = "") -> str:
+    """
+    兼容旧接口：构建完整系统提示词（静态 + 动态合并）。
+
+    ⚠️ 此函数保留用于向后兼容（Planner/Reviewer 等仍使用合并模式）。
+    Agent 的主循环已改用 build_static_system_prompt + build_dynamic_context 分离模式。
+    """
+    static = build_static_system_prompt(tool_descriptions)
+    dynamic = build_dynamic_context(skills_context, memory_context)
+    if dynamic:
+        return static + "\n\n" + dynamic
+    return static
 
 
 def build_planner_prompt(tool_descriptions: str, memory_context: str = "") -> str:
@@ -296,7 +368,6 @@ def select_relevant_rules(
         score = 0
 
         # 方式 1：规则文本中的关键词直接出现在任务文本中
-        rule_words = set(rule_lower)
         for keyword, task_triggers in _RULE_KEYWORD_MAP.items():
             if keyword in rule_lower:
                 for trigger in task_triggers:

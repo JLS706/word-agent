@@ -650,7 +650,12 @@ class MultiAgentOrchestrator:
                     self.checkpointer.save(task_id, state)
                 continue
 
-            # ── 失败：丢弃 Word 脏修改 + 回溯策略 ──\r\n            self._discard_word_changes(file_path)
+            # ── 失败：丢弃 Word 脏修改 + 回溯策略 ──
+            self._discard_word_changes(file_path)
+
+            # ── L2 效用反馈：验证失败 → 重惩罚召回的 L2 记忆 ──
+            if self.memory:
+                self.memory.penalize_recalled_memories(delta=0.5)
 
             # 关键性错误 → 直接跳过，汇报人类（不浪费重试和重规划）
             is_critical = reason.startswith("[CRITICAL]")

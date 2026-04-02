@@ -1,6 +1,11 @@
 # ==============================================================================
 # DocMaster Agent 配置文件
 # 复制此文件为 config.toml，然后填入你的 API Key
+#
+# 也可以用环境变量覆盖 API Key（优先级高于配置文件）：
+#   Windows:  set DOCMASTER_API_KEY=your_key && python main.py
+#   Linux:    DOCMASTER_API_KEY=your_key python main.py
+#   Docker:   DOCMASTER_API_KEY=your_key docker compose up
 # ==============================================================================
 
 # LLM 模型配置

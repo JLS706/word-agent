@@ -63,6 +63,7 @@ class Memory:
         self.embed_client = embed_client
         self._vector_store = None
         self._vector_cache_path = os.path.join(self.memory_dir, "memory_vectors.json")
+        self._last_recalled_l2_indices: list[int] = []  # 本轮召回的 L2 索引（用于反馈）
         self._load_vector_store()
 
     def _load_vector_store(self):
@@ -83,7 +84,7 @@ class Memory:
             self._vector_store = VectorStore()
 
     def _migrate_metadata(self):
-        """兼容旧版数据：为缺少 type/recall_count 的条目补全默认值"""
+        """兼容旧版数据：为缺少 type/recall_count/utility_score 的条目补全默认值"""
         if self._vector_store is None:
             return
         changed = False
@@ -96,6 +97,10 @@ class Memory:
                 changed = True
             if "last_recalled" not in meta:
                 meta["last_recalled"] = None
+                changed = True
+            # L2 记忆的效用分（强化学习反馈）
+            if meta.get("type") == "reflection" and "utility_score" not in meta:
+                meta["utility_score"] = 1.0
                 changed = True
         if changed:
             self._vector_store.save_cache(self._vector_cache_path)
@@ -365,6 +370,7 @@ class Memory:
 
             # ── 层感知冲突消解 ──
             l3_to_delete = []  # 要清理的 L3 索引
+            l2_replaced = False  # 是否已替换了 L2 条目
             if len(self._vector_store) > 0:
                 from core.embeddings import cosine_similarity
                 import numpy as np
@@ -399,6 +405,7 @@ class Memory:
                                 "time": now_str,
                                 "source": "task_completion_hook",
                                 "fused_from": action,
+                                "utility_score": 1.0,
                             }
                             l2_replaced = True
                             break
@@ -409,15 +416,13 @@ class Memory:
                                 score * 100,
                             )
                             l3_to_delete.append(i)
-                else:
-                    l2_replaced = False  # noqa: F841
 
                 # 清理被 L2 替代的 L3 条目（从后往前删）
                 if l3_to_delete:
                     self._delete_indices(l3_to_delete)
 
                 # 如果已替换了 L2，保存并返回
-                if 'l2_replaced' in dir() and l2_replaced:
+                if l2_replaced:
                     self._vector_store.save_cache(self._vector_cache_path)
                     return
 
@@ -428,6 +433,7 @@ class Memory:
                 "type": "reflection",
                 "time": now_str,
                 "source": "task_completion_hook",
+                "utility_score": 1.0,
             }]
             self._vector_store.add(
                 [experience_text], [embedding], metadata
@@ -445,15 +451,20 @@ class Memory:
     # ═════════════════════════════════════════════
 
     def recall_relevant(self, query: str, top_k: int = 3,
-                        min_score: float = 0.45) -> str:
+                        min_score: float = 0.60) -> str:
         """
-        根据当前问题，召回最相关的历史片段（含时间衰减 + 召回追踪）。
+        根据当前问题，召回最相关的历史片段（含时间衰减 + 召回追踪 + 效用分）。
 
-        最终得分 = 0.7 × 语义相似度 + 0.3 × 时间新鲜度
+        最终得分 = 0.55 × 语义相似度 + 0.25 × 时间新鲜度 + 0.20 × 效用分
         时间新鲜度: recency = exp(-days / 30)
+        效用分: utility = min(max(utility_score, 0), 2) / 2  → [0, 1]
 
-        副作用: 被命中的记忆 recall_count += 1, last_recalled 更新。
+        副作用:
+          - 被命中的记忆 recall_count += 1, last_recalled 更新
+          - 记录本轮召回的 L2 索引，供后续 reward/penalize 使用
         """
+        self._last_recalled_l2_indices = []  # 每轮重置
+
         if (not self.embed_client or self._vector_store is None
                 or len(self._vector_store) == 0):
             return ""
@@ -467,13 +478,23 @@ class Memory:
             if not candidates:
                 return ""
 
-            # ── 时间衰减重评分 ──
+            # ── 时间衰减 + 效用分 重评分 ──
             now = datetime.now()
             scored = []
             for r in candidates:
                 semantic = r["score"]
+                meta = r.get("metadata", {})
+                mem_type = meta.get("type", "conversation")
+
+                # 过滤被隔离的 L2 记忆（utility_score < 0）
+                if mem_type == "reflection":
+                    us = meta.get("utility_score", 1.0)
+                    if us < 0.0:
+                        continue  # 已被隔离，跳过
+
+                # 时间新鲜度
                 recency = 0.5
-                time_str = r.get("metadata", {}).get("time", "")
+                time_str = meta.get("time", "")
                 if time_str:
                     try:
                         mem_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
@@ -482,7 +503,11 @@ class Memory:
                     except ValueError:
                         pass
 
-                final_score = 0.7 * semantic + 0.3 * recency
+                # 效用分（仅 L2 有，L3 默认 1.0）
+                utility_raw = meta.get("utility_score", 1.0)
+                utility = min(max(utility_raw, 0.0), 2.0) / 2.0  # 归一化到 [0, 1]
+
+                final_score = 0.55 * semantic + 0.25 * recency + 0.20 * utility
                 scored.append({**r, "final_score": final_score})
 
             scored.sort(key=lambda x: x["final_score"], reverse=True)
@@ -494,17 +519,21 @@ class Memory:
             if not relevant:
                 return ""
 
-            # ── 召回追踪：更新 recall_count 和 last_recalled ──
+            # ── 召回追踪 + L2 索引记录 ──
             now_str = now.strftime("%Y-%m-%d %H:%M")
             tracking_changed = False
             for r in relevant:
-                # 找到这条记忆在 vector_store 中的索引
                 try:
                     idx = self._vector_store.chunks.index(r["chunk"])
                     meta = self._vector_store.metadata[idx]
                     meta["recall_count"] = meta.get("recall_count", 0) + 1
                     meta["last_recalled"] = now_str
                     tracking_changed = True
+
+                    # 记录本轮召回的 L2 索引（用于 reward/penalize 反馈）
+                    if meta.get("type") == "reflection":
+                        self._last_recalled_l2_indices.append(idx)
+
                 except (ValueError, IndexError):
                     pass
 
@@ -525,6 +554,96 @@ class Memory:
         except Exception as e:
             logger.warning("  [Memory] 向量召回失败(不影响主功能): %s", e)
             return ""
+
+    # ═════════════════════════════════════════════
+    # L2 效用反馈（强化学习式记忆淘汰）
+    # ═════════════════════════════════════════════
+
+    def reward_recalled_memories(self, delta: float = 0.1):
+        """
+        工具执行成功时奖励本轮召回的 L2 记忆。
+
+        类似推荐系统的正反馈：当召回的经验“帮助”了 Agent 成功执行，
+        就提升其效用分，使其在未来更容易被召回。
+        """
+        if not self._last_recalled_l2_indices or self._vector_store is None:
+            return
+
+        changed = False
+        for idx in self._last_recalled_l2_indices:
+            if idx < len(self._vector_store.metadata):
+                meta = self._vector_store.metadata[idx]
+                if meta.get("type") == "reflection":
+                    old = meta.get("utility_score", 1.0)
+                    meta["utility_score"] = round(old + delta, 2)
+                    changed = True
+                    if self.verbose_feedback:
+                        logger.debug(
+                            "  [Memory] L2 奖励 +%.1f: %.2f → %.2f | %s",
+                            delta, old, meta["utility_score"],
+                            self._vector_store.chunks[idx][:40],
+                        )
+
+        if changed:
+            self._vector_store.save_cache(self._vector_cache_path)
+
+    def penalize_recalled_memories(self, delta: float = 0.5):
+        """
+        执行失败时惩罚本轮召回的 L2 记忆。
+
+        类似推荐系统的负反馈：被召回的经验可能误导了 Agent，
+        降低其效用分。一旦降到 0 以下将被隔离或删除。
+        """
+        if not self._last_recalled_l2_indices or self._vector_store is None:
+            return
+
+        changed = False
+        for idx in self._last_recalled_l2_indices:
+            if idx < len(self._vector_store.metadata):
+                meta = self._vector_store.metadata[idx]
+                if meta.get("type") == "reflection":
+                    old = meta.get("utility_score", 1.0)
+                    meta["utility_score"] = round(old - delta, 2)
+                    changed = True
+                    logger.info(
+                        "  [Memory] L2 惩罚 -%.1f: %.2f → %.2f | %s",
+                        delta, old, meta["utility_score"],
+                        self._vector_store.chunks[idx][:40],
+                    )
+
+        if changed:
+            self._vector_store.save_cache(self._vector_cache_path)
+            self._quarantine_check()
+
+    def _quarantine_check(self):
+        """
+        清理 utility_score < 0 的 L2 记忆（“毒记忆”淘汰）。
+
+        一条记忆如果多次被召回后都伴随失败，说明它可能是"毒经验"——
+        误导 Agent 采取错误操作。直接删除以永久解除威胁。
+        """
+        if self._vector_store is None:
+            return
+
+        quarantined = []
+        for i, meta in enumerate(self._vector_store.metadata):
+            if (meta.get("type") == "reflection"
+                    and meta.get("utility_score", 1.0) < 0.0):
+                quarantined.append(i)
+
+        if quarantined:
+            for i in quarantined:
+                logger.warning(
+                    "  [Memory] 🚩 淘汰毒记忆 (utility=%.2f): %s",
+                    self._vector_store.metadata[i].get("utility_score", 0),
+                    self._vector_store.chunks[i][:60],
+                )
+            self._delete_indices(quarantined)
+
+    @property
+    def verbose_feedback(self) -> bool:
+        """控制效用反馈日志是否输出（奖励用 debug，惩罚用 info）"""
+        return True
 
     # ═════════════════════════════════════════════
     # 淘汰与晋升
@@ -681,19 +800,19 @@ class Memory:
     # ═════════════════════════════════════════════
 
     def _delete_indices(self, indices: list[int]):
-        """从 vector_store 中删除指定索引的条目（从后往前删，避免索引偏移）。"""
+        """从 vector_store 中删除指定索引的条目（统一重建，避免索引偏移）。"""
         if not indices or self._vector_store is None:
             return
         import numpy as np
 
-        indices = sorted(set(indices), reverse=True)
-        for i in indices:
-            if i < len(self._vector_store.chunks):
-                del self._vector_store.chunks[i]
-                del self._vector_store.metadata[i]
+        to_delete = set(indices)
+        total = len(self._vector_store.chunks)
+        keep = sorted(set(range(total)) - to_delete)
 
-        # 重建 embeddings 数组
-        keep = sorted(set(range(len(self._vector_store.embeddings))) - set(indices))
+        # 统一重建所有三个数据结构
+        self._vector_store.chunks = [self._vector_store.chunks[i] for i in keep]
+        self._vector_store.metadata = [self._vector_store.metadata[i] for i in keep]
+
         if keep and self._vector_store.embeddings.size > 0:
             self._vector_store.embeddings = self._vector_store.embeddings[keep]
         else:

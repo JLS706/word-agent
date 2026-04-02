@@ -22,26 +22,12 @@ if PROJECT_ROOT not in sys.path:
 
 
 def load_config() -> dict:
-    """加载配置文件"""
-    try:
-        import toml
-    except ImportError:
-        # 回退到标准库 tomllib (Python 3.11+)
-        try:
-            import tomllib as toml
-            # tomllib 只支持 rb 模式
-            config_path = os.path.join(PROJECT_ROOT, "config", "config.toml")
-            if not os.path.exists(config_path):
-                print("❌ 配置文件未找到！")
-                print(f"   请复制 config/config.example.toml 为 config/config.toml")
-                print(f"   然后填入你的 LLM API Key")
-                sys.exit(1)
-            with open(config_path, "rb") as f:
-                return toml.load(f)
-        except ImportError:
-            print("❌ 需要安装 toml 库: pip install toml")
-            sys.exit(1)
+    """
+    加载配置文件。
 
+    支持环境变量覆盖 API Key（优先级高于配置文件）：
+      DOCMASTER_API_KEY=xxx python main.py
+    """
     config_path = os.path.join(PROJECT_ROOT, "config", "config.toml")
     if not os.path.exists(config_path):
         print("❌ 配置文件未找到！")
@@ -49,8 +35,27 @@ def load_config() -> dict:
         print(f"   然后填入你的 LLM API Key")
         sys.exit(1)
 
-    with open(config_path, "r", encoding="utf-8") as f:
-        return toml.load(f)
+    # 选择 TOML 解析器：优先 toml 库，回退 tomllib（Python 3.11+）
+    try:
+        import toml
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = toml.load(f)
+    except ImportError:
+        try:
+            import tomllib
+            with open(config_path, "rb") as f:
+                config = tomllib.load(f)
+        except ImportError:
+            print("❌ 需要安装 toml 库: pip install toml")
+            sys.exit(1)
+
+    # 环境变量覆盖 API Key（Docker/CI 场景更安全）
+    env_key = os.environ.get("DOCMASTER_API_KEY")
+    if env_key:
+        config.setdefault("llm", {})["api_key"] = env_key
+
+    return config
+
 
 
 def create_agent(config: dict, dry_run: bool = False):
@@ -98,8 +103,8 @@ def create_agent(config: dict, dry_run: bool = False):
             base_url=llm_config.get("base_url", ""),
             model=llm_config.get("embedding_model", "gemini-embedding-001"),
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("⚠️ Embedding 客户端初始化失败（向量记忆和 RAG 将不可用）: %s", e)
 
     # 初始化本地记忆（含向量记忆）
     memory_dir = os.path.join(PROJECT_ROOT, "memory")

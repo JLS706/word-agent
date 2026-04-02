@@ -12,7 +12,6 @@ import traceback
 from core.llm import LLM
 from core.logger import logger
 from core.schema import AgentState, Message, Role, ToolResult
-from core.prompt import build_system_prompt
 from tools.base import ToolRegistry
 
 # Word 相关工具名集合（用于 L1 后校验：自动检查 close_word 是否被遗漏）
@@ -64,21 +63,42 @@ class Agent:
 
     def _build_system_prompt(self, skills_context: str = "",
                              recalled_context: str = ""):
-        """构建并设置系统提示词"""
+        """
+        构建系统提示词（静态根 + 动态叶分离，Prompt Cache 友好）。
+
+        消息布局：
+          Message[0]: 静态 System（L1 规则 + 工具 + 行为准则）→ 跨轮次不变，可被缓存
+          Message[1]: 动态 System（技能 + 记忆）→ 每轮变化，不影响 [0] 的缓存命中
+          Message[2..]: User / Assistant / Tool 对话历史
+
+        💡 设计原理：
+          大模型 API 的 Prompt Cache 匹配 Token 序列的最长公共前缀。
+          只要 Message[0] 内容不变，前缀就能命中缓存，获得 50%~90% 的降价。
+        """
+        from core.prompt import build_static_system_prompt, build_dynamic_context
+
         tool_desc = self.tools.describe()
         memory_context = (
             self.memory.get_context_summary(recalled_context)
             if self.memory else ""
         )
-        system_msg = Message(
-            role=Role.SYSTEM,
-            content=build_system_prompt(tool_desc, memory_context, skills_context),
-        )
-        # 替换或添加系统消息
-        if self.history and self.history[0].role == Role.SYSTEM:
-            self.history[0] = system_msg
-        else:
-            self.history.insert(0, system_msg)
+
+        # ── 静态根（跨轮次不变 → 缓存命中）──
+        static_content = build_static_system_prompt(tool_desc)
+        static_msg = Message(role=Role.SYSTEM, content=static_content)
+
+        # ── 动态叶（每轮可变 → 独立消息，不污染前缀）──
+        dynamic_content = build_dynamic_context(skills_context, memory_context)
+
+        # 清除旧的 system 消息（可能有 1~2 条）
+        while self.history and self.history[0].role == Role.SYSTEM:
+            self.history.pop(0)
+
+        # 按顺序插入：[0] 静态根, [1] 动态叶（如果有）
+        if dynamic_content.strip():
+            dynamic_msg = Message(role=Role.SYSTEM, content=dynamic_content)
+            self.history.insert(0, dynamic_msg)
+        self.history.insert(0, static_msg)
 
     def run(self, user_input: str) -> str:
         """
@@ -90,6 +110,11 @@ class Agent:
         Returns:
             Agent 的最终回答文本
         """
+        # ── 会话级重置：防止跨轮次状态累积 ──
+        self._session_tools = []
+        self._session_file = ""
+        self._retry_counts = {}
+
         # ── 向量记忆召回（RAG 式）──
         recalled = ""
         if self.memory:
@@ -244,8 +269,8 @@ class Agent:
                     tool_summaries.append(f"{tool_name}: {first_line}")
 
             scratchpad_text = (
-                "[已完成步骤] "
-                + "; ".join(tool_summaries) if tool_summaries
+                "[已完成步骤] " + "; ".join(tool_summaries)
+                if tool_summaries
                 else "[已完成若干步骤]"
             )
         else:
@@ -486,8 +511,8 @@ class Agent:
 
         # 重试跟踪：基于工具名计数（同名工具连续失败才计数）
         max_attempts = 3
-        self._retry_counts[name] = self._retry_counts.get(name, 0) + 1
-        attempt = self._retry_counts[name]
+        attempt = self._retry_counts.get(name, 0) + 1
+        self._retry_counts[name] = attempt
 
         # 实际执行
         try:
@@ -504,6 +529,10 @@ class Agent:
             self._session_tools.append(name)
             if "file_path" in arguments and not self._session_file:
                 self._session_file = arguments["file_path"]
+
+            # ── L2 效用反馈：工具成功 → 奖励召回的 L2 记忆 ──
+            if self.memory:
+                self.memory.reward_recalled_memories(delta=0.1)
 
             return ToolResult(
                 tool_call_id=call_id,
@@ -528,6 +557,11 @@ class Agent:
             )
             if self.verbose:
                 logger.error("  ❌ %s", summary)
+
+            # ── L2 效用反馈：工具失败 → 轻度惩罚召回的 L2 记忆 ──
+            if self.memory:
+                self.memory.penalize_recalled_memories(delta=0.2)
+
             return ToolResult(
                 tool_call_id=call_id,
                 name=name,

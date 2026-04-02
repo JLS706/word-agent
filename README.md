@@ -38,6 +38,7 @@
 | Multi-Agent 流水线 | Planner → Executor → Reviewer 三角色协作 |
 | 子任务反思 Hook | 子任务完成后自动提炼经验存入 L2 长期记忆 |
 | Token 水位压缩 | 基于 Token 估算的两级上下文压缩（规则截取 / LLM 摘要） |
+| Prompt Cache 优化 | 静态根 + 动态叶分离架构，自动命中厂商 KV Cache（降价 50%~90%） |
 | Skill 插件系统 | 按需加载技能手册（关键词 + Embedding 双层匹配） |
 | 多 Key 自动轮换 | API Key 失效时自动切换到下一个可用 Key |
 | 结构化错误恢复 | 三级错误分类 + 自动重试 + 引导 LLM 自修正 |
@@ -62,6 +63,17 @@ cp config/config.example.toml config/config.toml
 
 ```toml
 api_key = "key1, key2, key3"    # 失效自动切换到下一个
+```
+
+也可以通过环境变量注入（优先级高于配置文件，推荐 Docker/CI 场景）：
+
+```bash
+# Windows
+set DOCMASTER_API_KEY=your_key && python main.py
+# Linux/Mac
+DOCMASTER_API_KEY=your_key python main.py
+# Docker
+DOCMASTER_API_KEY=your_key docker compose up
 ```
 
 推荐使用免费方案：
@@ -103,7 +115,7 @@ agent/
 │   ├── schema.py               # 数据模型（Message, ToolCall, AgentState）
 │   ├── llm.py                  # LLM 接口封装（多 Key 自动轮换）
 │   ├── agent.py                # ReAct Agent 核心（Token 水位压缩 + 结构化错误恢复）
-│   ├── prompt.py               # System Prompt 模板（Executor / Planner / Reviewer）
+│   ├── prompt.py               # System Prompt 模板（静态根 + 动态叶，Prompt Cache 友好）
 │   ├── memory.py               # 三级分层记忆（L1核心/L2长期/L3短期 + 融合节点）
 │   ├── embeddings.py           # Embedding + 向量存储（纯 numpy 实现）
 │   ├── multi_agent.py          # Multi-Agent 流水线（回溯修正 + 反思 Hook）
@@ -149,9 +161,9 @@ agent/
 ```
 用户: "帮我检查论文格式并处理参考文献"
   ↓
-[Skill 匹配] "论文排版标准流" → 注入 System Prompt
+[Skill 匹配] "论文排版标准流" → 注入动态上下文
   ↓
-[记忆召回] 向量搜索相关历史 → 注入上下文
+[记忆召回] 向量搜索相关历史 → 注入动态上下文
   ↓
 Agent (Think): 先用 inspect_document_format 检查格式，再处理参考文献
   ↓
@@ -162,6 +174,24 @@ Agent (Act): format_references → 修复25条参考文献
 Agent (Observe): 成功 → 继续 | 失败 → 结构化错误引导自修正
   ↓
 Agent: "已完成！" → 保存 Q+A 到 L3 短期记忆
+```
+
+### Prompt Cache 优化（静态根 + 动态叶）
+
+```
+┌────────────────────────────────────────────────────────┐
+│ Message[0]: SYSTEM（静态根 — 跨轮次不变，KV Cache 缓存） │
+│   L1 核心规则 + 工具描述 + 行为准则 + L1 尾部重复         │
+├────────────────────────────────────────────────────────┤
+│ Message[1]: SYSTEM（动态叶 — 每轮变化，不污染前缀缓存）   │
+│   匹配到的 Skill 手册 + RAG 召回的历史记忆               │
+├────────────────────────────────────────────────────────┤
+│ Message[2..n]: USER / ASSISTANT / TOOL                │
+│   用户消息（含 L1 三明治注入） + 工具调用和结果            │
+└────────────────────────────────────────────────────────┘
+
+设计原理：Prompt Cache 匹配 Token 序列的最长公共前缀。
+只要 Message[0] 内容不变，前缀就能命中缓存，获得 50%~90% 降价。
 ```
 
 ### Multi-Agent 流水线（含回溯修正 + 反思 Hook）
