@@ -18,7 +18,8 @@ from tools.base import Tool
 
 
 # ────────────────────────────────────────────
-# 中文学术论文常见格式规范（诊断基准）
+# 中文学术论文常见格式规范（默认兆底值）
+# ── Skill config 中的 format_rules 会覆盖这里的值 ──
 # ────────────────────────────────────────────
 _ACADEMIC_CN_RULES = {
     "正文": {
@@ -221,10 +222,14 @@ class InspectDocFormatTool(Tool):
         end_para: int = 0,
         check_tables: bool = True,
         check_fields: bool = False,
+        format_rules: dict = None,
     ) -> str:
         abs_path = os.path.abspath(file_path)
         if not os.path.exists(abs_path):
             return f"文件不存在: {abs_path}"
+
+        # 合并格式规范：外部 format_rules 覆盖默认值，未定义的字段用默认值塬充
+        active_rules = self._merge_format_rules(format_rules)
 
         # 默认每次查看 20 段
         if end_para == 0:
@@ -387,9 +392,9 @@ class InspectDocFormatTool(Tool):
                     "line_spacing": line_spacing,
                 }
 
-                # ── 诊断格式问题 ──
+                # ── 诊断格式问题（使用合并后的规范） ──
                 category = _categorize_style(style_name)
-                rules = _ACADEMIC_CN_RULES.get(category, {})
+                rules = active_rules.get(category, {})
                 issues = _diagnose_paragraph(info, rules)
 
                 # ── 输出段落报告 ──
@@ -535,3 +540,44 @@ class InspectDocFormatTool(Tool):
 
         except Exception as e:
             return f"格式检查出错: {e}"
+
+    @staticmethod
+    def _merge_format_rules(external_rules: dict | None) -> dict:
+        """
+        合并外部格式规范与内置默认值。
+
+        合并策略：
+          - external_rules 中的值覆盖默认值
+          - external_rules 未定义的字段用默认值塬充
+          - 值为 None 的字段表示显式跳过该检查项
+
+        Args:
+            external_rules: Skill config 中的 format_rules（可为 None）
+
+        Returns:
+            合并后的格式规范字典
+        """
+        from copy import deepcopy
+
+        # 无外部规范 → 直接用默认
+        if not external_rules:
+            return deepcopy(_ACADEMIC_CN_RULES)
+
+        merged = deepcopy(_ACADEMIC_CN_RULES)
+
+        for category, fields in external_rules.items():
+            if not isinstance(fields, dict):
+                continue
+            if category not in merged:
+                # 新增的样式类别（默认值中没有的）
+                merged[category] = deepcopy(fields)
+            else:
+                # 已有的样式类别：逐字段覆盖
+                for field, value in fields.items():
+                    if value is None:
+                        # None 表示“不检查该字段”：从规范中删除
+                        merged[category].pop(field, None)
+                    else:
+                        merged[category][field] = value
+
+        return merged

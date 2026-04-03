@@ -4,19 +4,24 @@ DocMaster Agent - Skills 管理器
 
 实现 Skill 插件化架构：
   1. 扫描 skills/ 目录，加载所有 .md 文件
-  2. 解析 YAML frontmatter（名称、关键词、工具列表）
+  2. 解析 YAML frontmatter（名称、关键词、工具列表、config 参数块）
   3. 根据用户输入，用 Embedding 余弦相似度匹配最相关的 Skill
   4. 返回匹配到的 Skill 内容，注入到 System Prompt
+  5. 合并多个 Skill 的 config 块，注入到工具参数（高优先级覆盖低优先级）
 
 这样做的好处：
   - 用户说"你好"时不加载任何 Skill（省 Token）
   - 新增业务只需加一个 .md 文件（不改代码）
+  - 换规范只需换一个 .md 文件中的 config 块（零代码变更）
   - 匹配逻辑复用 RAG 模块的 Embedding + 余弦相似度
 """
 
 import os
 import re
-from typing import Optional
+from copy import deepcopy
+from typing import Any, Optional
+
+import yaml
 
 from core.logger import logger
 
@@ -25,7 +30,8 @@ class Skill:
     """一个 Skill 的结构化表示"""
 
     def __init__(self, name: str, description: str, keywords: list[str],
-                 tools: list[str], priority: int, content: str, file_path: str):
+                 tools: list[str], priority: int, content: str, file_path: str,
+                 config: dict | None = None):
         self.name = name
         self.description = description
         self.keywords = keywords
@@ -33,6 +39,7 @@ class Skill:
         self.priority = priority
         self.content = content          # Markdown 正文（不含 frontmatter）
         self.file_path = file_path
+        self.config = config or {}      # Skill 参数块（如 format_rules）
         self.embedding: list[float] = []  # 启动时预计算
 
     def get_search_text(self) -> str:
@@ -92,6 +99,11 @@ class SkillManager:
         trigger_keywords: [a, b, c]
         tools: [tool1, tool2]
         priority: 10
+        config:
+          format_rules:
+            正文:
+              font_cn: "宋体"
+              font_size: 12.0
         ---
         正文内容...
         """
@@ -101,48 +113,37 @@ class SkillManager:
         except Exception:
             return None
 
-        # 解析 YAML frontmatter（简单正则，不依赖 pyyaml）
+        # 提取 YAML frontmatter
         fm_match = re.match(r'^---\s*\n(.*?)\n---\s*\n', text, re.DOTALL)
         if not fm_match:
             return None
 
-        frontmatter = fm_match.group(1)
+        frontmatter_text = fm_match.group(1)
         content = text[fm_match.end():]
 
-        # 提取字段
-        name = self._extract_field(frontmatter, "name", "")
-        description = self._extract_field(frontmatter, "description", "")
-        keywords = self._extract_list(frontmatter, "trigger_keywords")
-        tools = self._extract_list(frontmatter, "tools")
-        priority = int(self._extract_field(frontmatter, "priority", "5"))
+        # 使用 PyYAML 解析 frontmatter（支持嵌套结构）
+        try:
+            meta = yaml.safe_load(frontmatter_text)
+            if not isinstance(meta, dict):
+                return None
+        except yaml.YAMLError as e:
+            logger.warning("[Skills] YAML 解析失败 (%s): %s", file_path, e)
+            return None
 
+        name = meta.get("name", "")
         if not name:
             return None
 
         return Skill(
             name=name,
-            description=description,
-            keywords=keywords,
-            tools=tools,
-            priority=priority,
+            description=meta.get("description", ""),
+            keywords=meta.get("trigger_keywords", []),
+            tools=meta.get("tools", []),
+            priority=int(meta.get("priority", 5)),
             content=content.strip(),
             file_path=file_path,
+            config=meta.get("config", {}),
         )
-
-    @staticmethod
-    def _extract_field(text: str, field: str, default: str) -> str:
-        """从 YAML 文本中提取单值字段"""
-        match = re.search(rf'^{field}:\s*(.+)$', text, re.MULTILINE)
-        return match.group(1).strip() if match else default
-
-    @staticmethod
-    def _extract_list(text: str, field: str) -> list[str]:
-        """从 YAML 文本中提取列表字段（[a, b, c] 格式）"""
-        match = re.search(rf'^{field}:\s*\[(.+)\]', text, re.MULTILINE)
-        if not match:
-            return []
-        items = match.group(1).split(",")
-        return [item.strip().strip("'\"") for item in items if item.strip()]
 
     # ─────────────────────────────────────────
     # 匹配逻辑
@@ -161,7 +162,7 @@ class SkillManager:
             threshold: Embedding 匹配的最低相似度阈值
         
         Returns:
-            匹配到的 Skill 列表（按优先级排序）
+            匹配到的 Skill 列表（按优先级排序，高优先级在前）
         """
         # Layer 1: 关键词匹配
         keyword_matches = self._match_by_keywords(user_input)
@@ -187,7 +188,7 @@ class SkillManager:
         if not matched:
             return []
 
-        # 按命中关键词数 × 优先级排序
+        # 按命中关键词数 × 优先级排序（高优先级在前）
         matched.sort(key=lambda x: (x[1] * x[0].priority), reverse=True)
         return [s for s, _ in matched]
 
@@ -234,6 +235,68 @@ class SkillManager:
             logger.warning("[Skills] Embedding 预计算失败: %s", e)
 
     # ─────────────────────────────────────────
+    # Config 合并（核心新增功能）
+    # ─────────────────────────────────────────
+
+    def get_active_config(self, matched_skills: list[Skill]) -> dict:
+        """
+        合并多个 Skill 的 config 块，返回最终生效的配置。
+
+        合并策略：高优先级覆盖，低优先级填充。
+          - matched_skills 已按优先级降序排列（高优先级在前）
+          - 先铺低优先级的 config（兜底）
+          - 再用高优先级的 config 覆盖（特化）
+          - 值为 None/null 表示"不要这个字段"（显式跳过）
+
+        示例：
+          通用 Skill:    { format_rules: { 正文: { font_cn: "宋体", line_spacing: 1.5 } } }
+          B 校 Skill:    { format_rules: { 正文: { font_cn: "仿宋" } } }
+          合并结果:      { format_rules: { 正文: { font_cn: "仿宋", line_spacing: 1.5 } } }
+
+        Returns:
+            合并后的 config 字典
+        """
+        if not matched_skills:
+            return {}
+
+        # 过滤出有 config 的 Skill
+        skills_with_config = [s for s in matched_skills if s.config]
+        if not skills_with_config:
+            return {}
+
+        # 按优先级升序排列（低优先级先铺底，高优先级后覆盖）
+        # matched_skills 已经是降序的，反转即可
+        ordered = list(reversed(skills_with_config))
+
+        # 逐层深度合并
+        merged = {}
+        for skill in ordered:
+            merged = self._deep_merge(merged, skill.config)
+
+        return merged
+
+    @staticmethod
+    def _deep_merge(base: dict, override: dict) -> dict:
+        """
+        深度合并两个字典。
+
+        规则：
+          - override 中的值覆盖 base 中的同名键
+          - 如果两边都是 dict → 递归合并
+          - 如果 override 的值是 None → 标记为显式跳过（保留 None）
+          - 否则 override 的值直接覆盖 base
+        """
+        result = deepcopy(base)
+        for key, value in override.items():
+            if (key in result
+                    and isinstance(result[key], dict)
+                    and isinstance(value, dict)):
+                result[key] = SkillManager._deep_merge(result[key], value)
+            else:
+                result[key] = deepcopy(value)
+        return result
+
+    # ─────────────────────────────────────────
     # 输出
     # ─────────────────────────────────────────
 
@@ -258,6 +321,7 @@ class SkillManager:
                 "description": s.description,
                 "keywords": s.keywords,
                 "tools": s.tools,
+                "has_config": bool(s.config),
             }
             for s in self.skills
         ]

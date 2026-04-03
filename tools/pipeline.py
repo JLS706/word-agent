@@ -29,10 +29,14 @@ class AnalyzeDocumentTool(Tool):
         "required": ["file_path"],
     }
 
-    def execute(self, file_path: str) -> str:
+    def execute(self, file_path: str, acronym_whitelist: list = None) -> str:
         abs_path = os.path.abspath(file_path)
         if not os.path.exists(abs_path):
             return f"文件不存在: {abs_path}"
+
+        # 缩写白名单：优先用 Skill config 提供的，否则用默认值
+        default_whitelist = {'IEEE', 'ACM', 'DOI', 'HTTP', 'URL', 'PDF', 'USB', 'GPS'}
+        whitelist = set(acronym_whitelist) if acronym_whitelist else default_whitelist
 
         try:
             import win32com.client
@@ -142,10 +146,9 @@ class AnalyzeDocumentTool(Tool):
             else:
                 report.append(f"  - 未检测到LaTeX公式")
 
-            # ── 检测4：缩写词 ──
+            # ── 检测4：缩写词（使用可配置的白名单） ──
             acronyms = set(re.findall(r'\b[A-Z]{2,6}\b', body_text))
-            common_words = {'IEEE', 'ACM', 'DOI', 'HTTP', 'URL', 'PDF', 'USB', 'GPS'}
-            acronyms -= common_words
+            acronyms -= whitelist
             report.append(f"\n[缩写词]")
             report.append(f"  - 检测到 {len(acronyms)} 个疑似专业缩写")
             if acronyms:
@@ -165,3 +168,4 @@ class AnalyzeDocumentTool(Tool):
 
         except Exception as e:
             return f"分析文档时出错: {e}"
+

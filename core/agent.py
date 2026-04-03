@@ -55,6 +55,7 @@ class Agent:
         self._session_tools: list[str] = []   # 本轮执行过的工具名
         self._session_file: str = ""           # 本轮操作的文件路径
         self._retry_counts: dict[str, int] = {}  # 工具重试计数器
+        self._active_config: dict = {}           # 本轮 Skill config（会话级）
         self._token_warning = 6000   # Token 水位：触发规则压缩（4000→6000，避免过早压缩稀释 L1）
         self._token_critical = 8000  # Token 水位：触发 LLM 深度压缩
 
@@ -114,6 +115,7 @@ class Agent:
         self._session_tools = []
         self._session_file = ""
         self._retry_counts = {}
+        self._active_config = {}
 
         # ── 向量记忆召回（RAG 式）──
         recalled = ""
@@ -122,14 +124,19 @@ class Agent:
             if self.verbose and recalled:
                 logger.info("📌 已召回 %d 条相关历史", recalled.count('相关度'))
 
-        # 根据用户输入匹配 Skills，动态重建系统提示词
+        # 根据用户输入匹配 Skills，动态重建系统提示词 + 提取 Config
         skills_ctx = ""
         if self.skill_manager:
             matched = self.skill_manager.match(user_input)
             skills_ctx = self.skill_manager.build_skills_context(matched)
+            # 合并匹配到的 Skill 的 config 块（高优先级覆盖低优先级）
+            self._active_config = self.skill_manager.get_active_config(matched)
             if self.verbose and matched:
                 names = [s.name for s in matched]
                 logger.info("📚 已加载技能: %s", ', '.join(names))
+                if self._active_config:
+                    logger.info("⚙️ 已注入 Skill Config: %s",
+                                list(self._active_config.keys()))
 
         # 重建系统提示词（含召回的历史 + 技能）
         self._build_system_prompt(skills_ctx, recalled)
@@ -514,6 +521,10 @@ class Agent:
         attempt = self._retry_counts.get(name, 0) + 1
         self._retry_counts[name] = attempt
 
+        # ── Skill Config 注入：将 config 中该工具对应的参数作为默认值注入 ──
+        # LLM 显式传递的参数优先级更高，不会被 config 覆盖
+        arguments = self._inject_skill_config(name, arguments)
+
         # 实际执行
         try:
             output = tool.execute(**arguments)
@@ -648,6 +659,52 @@ class Agent:
         if self.memory and user_input:
             self.memory.add_to_vector(user_input, summary)
 
+    # ─────────────────────────────────────────────
+    # Skill Config → 工具参数注入
+    # ─────────────────────────────────────────────
+
+    # 工具名 → config 中对应的参数键 映射表
+    # 定义了哪些 config 键应该注入到哪个工具
+    _TOOL_CONFIG_MAP = {
+        "inspect_document_format": ["format_rules"],
+        "analyze_document": ["acronym_whitelist", "pipeline_order"],
+    }
+
+    def _inject_skill_config(self, tool_name: str, arguments: dict) -> dict:
+        """
+        将 Skill Config 中的相关参数注入到工具调用中。
+
+        注入原则：
+          - config 参数作为默认值（优先级低于 LLM 显式传参）
+          - 只注入 _TOOL_CONFIG_MAP 中声明的参数
+          - LLM 已经传递的参数不会被覆盖
+
+        Args:
+            tool_name: 工具名称
+            arguments: LLM 传递的原始参数
+
+        Returns:
+            注入 config 后的参数字典
+        """
+        if not self._active_config:
+            return arguments
+
+        config_keys = self._TOOL_CONFIG_MAP.get(tool_name)
+        if not config_keys:
+            return arguments
+
+        injected = dict(arguments)  # 浅拷贝，不修改原始参数
+        for key in config_keys:
+            if key not in injected and key in self._active_config:
+                value = self._active_config[key]
+                if value is not None:  # null 表示显式跳过
+                    injected[key] = value
+                    if self.verbose:
+                        logger.debug("  ⚙️ Skill Config 注入: %s.%s",
+                                     tool_name, key)
+
+        return injected
+
     def reset(self):
         """重置 Agent 状态（保留系统提示词）"""
         system_msg = self.history[0] if self.history else None
@@ -658,3 +715,4 @@ class Agent:
         self._session_tools = []
         self._session_file = ""
         self._retry_counts = {}
+        self._active_config = {}
