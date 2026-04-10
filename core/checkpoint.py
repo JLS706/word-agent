@@ -24,6 +24,8 @@ from core.logger import logger
 class WorkflowPhase(str, Enum):
     """工作流阶段"""
     NOT_STARTED = "not_started"
+    PREPROCESSING = "preprocessing"
+    PREPROCESS_DONE = "preprocess_done"
     PLANNING = "planning"
     PLAN_DONE = "plan_done"
     EXECUTING = "executing"

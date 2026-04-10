@@ -176,8 +176,18 @@ class IndexDocumentTool(BaseTool):
         if not text.strip():
             return "文档内容为空"
 
-        # 分块
-        chunk_dicts = _chunk_text(text, chunk_size=500, overlap=50)
+        # 分块（优先语义切块，回退到机械切块）
+        try:
+            from core.semantic_chunker import semantic_chunk
+            embed_client = _get_embed_client()
+            chunk_dicts = semantic_chunk(text, embed_client)
+            if not chunk_dicts:
+                # 语义切块返回空，回退
+                chunk_dicts = _chunk_text(text, chunk_size=500, overlap=50)
+        except Exception:
+            # 语义切块失败，回退到机械切块
+            chunk_dicts = _chunk_text(text, chunk_size=500, overlap=50)
+
         if not chunk_dicts:
             return "文档分块后为空"
 

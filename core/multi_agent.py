@@ -14,7 +14,7 @@ import traceback
 from core.llm import LLM
 from core.logger import logger
 from core.schema import Message, Role
-from core.prompt import build_planner_prompt, build_reviewer_prompt
+from core.prompt import build_planner_prompt, build_reviewer_prompt, build_preprocessor_prompt
 from core.checkpoint import Checkpointer, WorkflowState, WorkflowPhase
 
 
@@ -185,6 +185,136 @@ class MultiAgentOrchestrator:
         except Exception as e:
             logger.warning("  [Reflection] 反思失败(不影响主流程): %s", e)
 
+    # ─────────────────────────────────────────────
+    # 输入类型检测（是否为无结构纯文本）
+    # ─────────────────────────────────────────────
+
+    @staticmethod
+    def _detect_input_type(file_path: str) -> str:
+        """
+        检测文档是否为无结构纯文本。
+
+        通过检查文档中是否有 Heading 样式的段落来判断：
+          - 有标题样式 → "structured"（已有结构，跳过预处理）
+          - 全是正文/Normal → "unstructured"（无结构，需预处理）
+
+        Returns:
+            "structured" | "unstructured"
+        """
+        try:
+            import win32com.client
+
+            word = win32com.client.Dispatch("Word.Application")
+            word.Visible = True
+
+            doc = None
+            abs_path = os.path.abspath(file_path)
+            try:
+                for d in word.Documents:
+                    if os.path.abspath(d.FullName).lower() == abs_path.lower():
+                        doc = d
+                        break
+            except Exception:
+                pass
+
+            if doc is None:
+                doc = word.Documents.Open(abs_path)
+                opened_by_us = True
+            else:
+                opened_by_us = False
+
+            heading_count = 0
+            total_paras = doc.Paragraphs.Count
+            # 抽样检查前 50 段（避免大文档性能问题）
+            check_limit = min(total_paras, 50)
+
+            for i in range(1, check_limit + 1):
+                try:
+                    style_name = str(doc.Paragraphs(i).Style.NameLocal)
+                    if "标题" in style_name or "Heading" in style_name:
+                        heading_count += 1
+                except Exception:
+                    pass
+
+            if opened_by_us:
+                doc.Close(SaveChanges=0)
+
+            # 有 2 个以上标题样式 → 认为已有结构
+            if heading_count >= 2:
+                logger.info("[Pipeline] 文档已有结构（%d 个标题样式），跳过预处理", heading_count)
+                return "structured"
+            else:
+                logger.info("[Pipeline] 检测到无结构文档（仅 %d 个标题样式），将执行预处理", heading_count)
+                return "unstructured"
+
+        except Exception as e:
+            logger.warning("[Pipeline] 输入类型检测失败: %s，默认为 structured", e)
+            return "structured"
+
+    def _run_preprocessor(self, file_path: str) -> str:
+        """
+        Phase 0: Preprocessor 对无结构纯文本进行清洗 + 结构推演。
+
+        使用 Agent 的 ReAct 循环，加载 text_cleaning 和
+        structure_inference 两个 Skill 的上下文来引导行为。
+        """
+        try:
+            tool_desc = self.tools.describe()
+            system_prompt = build_preprocessor_prompt(tool_desc)
+
+            messages = [
+                Message(role=Role.SYSTEM, content=system_prompt),
+                Message(
+                    role=Role.USER,
+                    content=(
+                        f"请对以下文档进行预处理（清洗 + 结构推演）：{file_path}\n\n"
+                        f"这是一份从 PDF 复制粘贴的纯文本文档，请先检测格式伪影，"
+                        f"然后推断文档的章节结构。"
+                    ),
+                ),
+            ]
+
+            # Preprocessor 可调用的工具（只读 + 分析）
+            preprocessor_tools = []
+            allowed = {"read_document", "execute_python", "index_document",
+                       "search_document", "close_word"}
+            for t in self.tools.to_openai_tools():
+                if t["function"]["name"] in allowed:
+                    preprocessor_tools.append(t)
+
+            # ReAct 循环（最多 5 步，预处理可能需要多步分析）
+            for step in range(5):
+                response = self.llm.chat(messages, tools=preprocessor_tools)
+                messages.append(response)
+
+                if not response.tool_calls:
+                    return response.content or "(Preprocessor 未生成报告)"
+
+                for tc in response.tool_calls:
+                    tool = self.tools.get(tc.name)
+                    if tool:
+                        try:
+                            output = tool.execute(**tc.arguments)
+                            if self.verbose:
+                                display = output[:200] + "..." if len(output) > 200 else output
+                                logger.debug("  🧹 Preprocessor 调用: %s → %s", tc.name, display)
+                        except Exception as e:
+                            output = f"工具执行失败: {e}"
+                    else:
+                        output = f"未找到工具: {tc.name}"
+
+                    messages.append(Message(
+                        role=Role.TOOL,
+                        content=output,
+                        tool_call_id=tc.id,
+                        name=tc.name,
+                    ))
+
+            return "(Preprocessor 超时)"
+
+        except Exception as e:
+            return f"Preprocessor 异常: {e}\n{traceback.format_exc()}"
+
     def run_pipeline(self, file_path: str) -> str:
         """Run pipeline with checkpoint save/resume support."""
         task_id = self._make_task_id(file_path)
@@ -202,11 +332,34 @@ class MultiAgentOrchestrator:
         # ── 文档事务：Pipeline 开始时备份 ──
         backup_path = self._backup_document(file_path)
 
-        # Phase 1: Planner
-        if state.phase in (WorkflowPhase.NOT_STARTED, WorkflowPhase.PLANNING):
+        # ── 检测输入类型：决定是否需要预处理 ──
+        needs_preprocessing = False
+        if state.phase in (WorkflowPhase.NOT_STARTED, WorkflowPhase.PREPROCESSING):
+            input_type = self._detect_input_type(file_path)
+            needs_preprocessing = (input_type == "unstructured")
+
+        # 动态计算总阶段数
+        total_phases = 4 if needs_preprocessing else 3
+        phase_offset = 1 if needs_preprocessing else 0
+
+        # Phase 0: Preprocessor（仅当检测到无结构纯文本时）
+        if needs_preprocessing and state.phase in (WorkflowPhase.NOT_STARTED, WorkflowPhase.PREPROCESSING):
             if self.verbose:
                 logger.info("\n" + "=" * 60)
-                logger.info("  Phase 1/3 - Planner")
+                logger.info("  Phase 0/%d - Preprocessor（清洗 + 结构推演）", total_phases)
+                logger.info("=" * 60)
+            state.phase = WorkflowPhase.PREPROCESSING
+            preprocess_result = self._run_preprocessor(file_path)
+            state.report_parts.append("## Preprocessing\n" + preprocess_result)
+            state.phase = WorkflowPhase.PREPROCESS_DONE
+            if self.checkpointer:
+                self.checkpointer.save(task_id, state)
+
+        # Phase 1: Planner
+        if state.phase in (WorkflowPhase.NOT_STARTED, WorkflowPhase.PREPROCESS_DONE, WorkflowPhase.PLANNING):
+            if self.verbose:
+                logger.info("\n" + "=" * 60)
+                logger.info("  Phase %d/%d - Planner", 1 + phase_offset, total_phases)
                 logger.info("=" * 60)
             state.phase = WorkflowPhase.PLANNING
             plan = self._run_planner(file_path)
@@ -220,7 +373,7 @@ class MultiAgentOrchestrator:
         if state.phase in (WorkflowPhase.PLAN_DONE, WorkflowPhase.EXECUTING):
             if self.verbose:
                 logger.info("\n" + "=" * 60)
-                logger.info("  Phase 2/3 - Executor")
+                logger.info("  Phase %d/%d - Executor", 2 + phase_offset, total_phases)
                 logger.info("=" * 60)
             state.phase = WorkflowPhase.EXECUTING
             exec_result = self._run_executor_with_backtracking(
@@ -235,7 +388,7 @@ class MultiAgentOrchestrator:
         if state.phase in (WorkflowPhase.EXEC_DONE, WorkflowPhase.REVIEWING):
             if self.verbose:
                 logger.info("\n" + "=" * 60)
-                logger.info("  Phase 3/3 - Reviewer")
+                logger.info("  Phase %d/%d - Reviewer", 3 + phase_offset, total_phases)
                 logger.info("=" * 60)
             state.phase = WorkflowPhase.REVIEWING
             exec_text = ""
@@ -252,10 +405,14 @@ class MultiAgentOrchestrator:
         # ── 文档事务：Pipeline 成功完成，清理备份 ──
         self._cleanup_backup(backup_path)
 
+        pipeline_actions = ["pipeline:planner", "pipeline:executor", "pipeline:reviewer"]
+        if needs_preprocessing:
+            pipeline_actions.insert(0, "pipeline:preprocessor")
+
         if self.memory:
             self.memory.add_session(
                 file_path=file_path,
-                actions=["pipeline:planner", "pipeline:executor", "pipeline:reviewer"],
+                actions=pipeline_actions,
                 summary="Pipeline done",
             )
         if self.checkpointer:
