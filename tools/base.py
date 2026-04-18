@@ -5,7 +5,11 @@ DocMaster Agent - Tool 基类
 """
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Callable, Optional
+
+# 进度回调签名: (percent: int, message: str) -> None
+# 由异步引擎在调用工具前注入，工具线程内可安全调用
+ProgressCallback = Callable[[int, str], None]
 
 
 class Tool(ABC):
@@ -15,6 +19,29 @@ class Tool(ABC):
     name: str = ""
     description: str = ""
     parameters: dict = {}  # JSON Schema 格式
+
+    # 由异步引擎在执行前注入，工具完成后置 None
+    # 工具代码通过 self.report_progress(percent, msg) 调用即可
+    _progress_callback: Optional[ProgressCallback] = None
+
+    def report_progress(self, percent: int, message: str = "") -> None:
+        """
+        向上层报告执行进度（0-100）。
+
+        仅在异步流式引擎 (run_async) 中生效。
+        同步调用 (run) 时回调为 None，自动静默跳过。
+
+        用法（在子类 execute 中调用）::
+
+            self.report_progress(30, "正在扫描参考文献...")
+            # ... 做一些耗时操作 ...
+            self.report_progress(70, "正在检测图注...")
+        """
+        if self._progress_callback is not None:
+            self._progress_callback(
+                max(0, min(100, percent)),  # 钳位到 [0, 100]
+                message,
+            )
 
     @abstractmethod
     def execute(self, **kwargs) -> str:

@@ -12,6 +12,7 @@ DocMaster Agent - 主入口
 import os
 import sys
 import argparse
+import asyncio
 
 from core.logger import logger
 
@@ -203,158 +204,66 @@ def test_connection(config: dict):
         traceback.print_exc()
 
 
-def interactive_loop(agent, orchestrator=None):
-    """交互式命令循环"""
+async def interactive_loop_async(agent, orchestrator=None):
+    """异步交互循环：实时消费 Agent 发射的 StreamEvent"""
     print("\n" + "=" * 60)
-    print("  🤖 DocMaster Agent — 学术论文排版智能助手")
-    print("  输入你的需求，Agent 会自动选择工具完成任务")
+    print("  🤖 DocMaster Agent [异步流式引擎版]")
     print("  输入 'quit' 或 'exit' 退出")
-    print("  输入 'reset' 重置对话历史")
-    print("  输入 'tools' 查看可用工具列表")
     print("=" * 60)
 
     while True:
+        # 接收用户输入（使用 asyncio.to_thread 防止阻塞事件循环）
         try:
-            user_input = input("\n🧑 你: ").strip()
+            user_input = await asyncio.to_thread(input, "\n🧑 你: ")
+            user_input = user_input.strip()
         except (KeyboardInterrupt, EOFError):
             print("\n👋 再见！")
             break
 
         if not user_input:
             continue
-
-        cmd = user_input.lower()
-        if cmd in ("quit", "exit", "q"):
+        if user_input.lower() in ("quit", "exit", "q"):
             print("👋 再见！")
             break
-        elif cmd == "reset":
-            agent.reset()
-            print("🔄 对话历史已重置。")
-            continue
-        elif cmd == "tools":
-            print("\n📦 可用工具:")
-            print(agent.tools.describe())
-            continue
 
-        # ── 任务复杂度路由器（关键词规则，零 API 调用）──
-        route, file_path = _classify_task(user_input)
+        print("\n🤖 Agent: ", end="", flush=True)
 
-        if route == "pipeline" and orchestrator and file_path:
-            logger.info("🧭 [路由器] 检测到全流程任务，自动启动 Multi-Agent 流水线")
-            orchestrator.run_pipeline(file_path)
-            continue
+        # 【核心】消费异步生成器！就像接住水管里流出来的水
+        try:
+            async for event in agent.run_async(user_input):
+                if event.type == "text":
+                    # 实时打印大模型思考的文字（打字机效果）
+                    print(event.content, end="", flush=True)
+                elif event.type == "tool_start":
+                    # 打印高亮的工具调用提示
+                    print(f"\n\n[🔧 {event.content}]", end="", flush=True)
+                elif event.type == "tool_progress":
+                    # 终端进度条：覆写当前行
+                    pct = event.metadata.get("percent", 0)
+                    bar_len = 20
+                    filled = int(bar_len * pct / 100)
+                    bar = "█" * filled + "░" * (bar_len - filled)
+                    print(f"\r  [{bar}] {pct:3d}% {event.content}", end="", flush=True)
+                elif event.type == "tool_end":
+                    # 清除进度条行，打印完成状态
+                    print(f"\r  ✅ {event.content}" + " " * 40, flush=True)
+                elif event.type == "error":
+                    print(f"\n[❌ 错误] {event.content}", flush=True)
+                elif event.type == "finish":
+                    print(f"\n[✅ {event.content}]", end="", flush=True)
+            print() # 换行收尾
+        except Exception as e:
+            print(f"\n[💥 引擎崩溃] {e}")
 
-        # 普通对话走单 Agent 模式（如果路由器判定为 pipeline 但没提取到文件路径，
-        # 则交给 Agent 自行处理，Agent 可能会调用 run_pipeline 工具）
-        response = agent.run(user_input)
-        if not agent.verbose:
-            print(f"\n🤖 Agent: {response}")
-
-
-# ─────────────────────────────────────────────
-# 任务复杂度分类器（关键词规则，零 API 调用）
-# ─────────────────────────────────────────────
-
-# 全流程关键词（命中任意一个 → pipeline 模式）
-_PIPELINE_KEYWORDS = [
-    # 显式全流程指令
-    "全面处理", "完整排版", "全部处理", "所有格式",
-    "一键处理", "一键排版", "全套", "全流程",
-    "从头到尾", "帮我全部做", "全部做了", "都处理",
-    "完整处理", "整体排版", "统一处理",
-    # 显式 pipeline 指令（兼容旧用法）
-    "pipeline",
-]
-
-# 单一任务关键词（命中 → 强制单 Agent，即使同时命中全流程词）
-_SINGLE_TASK_OVERRIDES = [
-    "只检查", "只处理", "只格式化", "只看",
-    "仅检查", "仅处理",
-    "检查一下", "看一下",
-    "你好", "hello", "hi",
-]
-
-
-def _classify_task(user_input: str) -> tuple[str, str]:
-    """
-    任务复杂度分类器。
-
-    策略（两层规则，零 API 调用）：
-      1. 先检查"单一任务覆盖词" → 如果命中，强制走单 Agent
-      2. 再检查"全流程关键词" → 如果命中，走 pipeline
-
-    Returns:
-        (route, file_path)
-        route: "pipeline" | "single"
-        file_path: 提取到的文件路径（可能为空）
-    """
-    input_lower = user_input.lower()
-
-    # Layer 1: 单一任务覆盖（优先级最高）
-    for kw in _SINGLE_TASK_OVERRIDES:
-        if kw in input_lower:
-            return "single", ""
-
-    # Layer 2: 全流程关键词
-    hit = False
-    for kw in _PIPELINE_KEYWORDS:
-        if kw in input_lower:
-            hit = True
-            break
-
-    if not hit:
-        return "single", ""
-
-    # 提取文件路径（支持 .docx 结尾的路径）
-    file_path = _extract_file_path(user_input)
-    return "pipeline", file_path
-
-
-def _extract_file_path(text: str) -> str:
-    """
-    从用户输入中提取 .docx 文件路径。
-
-    支持格式：
-      - C:\\Users\\xxx\\论文.docx
-      - "C:\\Users\\xxx\\论文.docx"
-      - C:/Users/xxx/论文.docx
-    """
-    import re
-
-    # 匹配 Windows 路径（带盘符）
-    match = re.search(r'[A-Za-z]:[\\\/][^\s"\']*\.docx', text, re.IGNORECASE)
-    if match:
-        return match.group(0)
-
-    # 匹配相对路径
-    match = re.search(r'[\w\u4e00-\u9fff][^\s"\']*\.docx', text, re.IGNORECASE)
-    if match:
-        return match.group(0)
-
-    return ""
-
-
-def main():
-    parser = argparse.ArgumentParser(description="DocMaster Agent - 学术论文排版智能助手")
-    parser.add_argument("--dry-run", action="store_true", help="Dry-run模式，不实际执行工具")
-    parser.add_argument("--test", action="store_true", help="测试LLM连通性")
-    args = parser.parse_args()
-
-    # 加载配置
+# 将入口函数也改为异步
+async def main_async():
+    # 你的参数解析等逻辑...
     config = load_config()
-
-    if args.test:
-        test_connection(config)
-        return
-
-    # 创建 Agent 和 Multi-Agent 编排器
-    agent, orchestrator = create_agent(config, dry_run=args.dry_run)
-
-    if args.dry_run:
-        logger.info("🏜️  Dry-Run 模式已启用，工具将不会实际执行。")
-
-    interactive_loop(agent, orchestrator)
-
+    agent, orchestrator = create_agent(config) # 这里恢复正常
+    
+    # 启动异步交互循环
+    await interactive_loop_async(agent, orchestrator)
 
 if __name__ == "__main__":
-    main()
+    # 使用 asyncio.run 启动整个异步系统
+    asyncio.run(main_async())

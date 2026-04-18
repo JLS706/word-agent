@@ -8,6 +8,25 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
 
+@dataclass
+class StreamEvent:
+    """
+    Agent 向外发射的流式事件契约。
+
+    事件类型 (type):
+        - "text"           : LLM 思考的文本增量（打字机效果）
+        - "tool_start"     : 工具开始执行（metadata 含 tool, args）
+        - "tool_progress"  : 工具执行中的进度更新（metadata 含 percent, tool）
+        - "tool_end"       : 工具执行完毕（metadata 含 success, tool）
+        - "error"          : 发生错误
+        - "finish"         : 本轮任务结束
+
+    上层消费者（终端 / WebSocket / IDE Bridge）只需 switch-case 这些类型即可。
+    """
+    type: str              # 事件类型
+    content: str           # 文本内容或状态描述
+    metadata: dict = field(default_factory=dict) # 携带的额外结构化数据（如 tool_name）
+
 
 class AgentState(Enum):
     """Agent 运行状态"""

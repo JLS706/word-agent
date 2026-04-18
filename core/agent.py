@@ -5,13 +5,18 @@ DocMaster Agent - ReAct Agent 核心
   Think → Act → Observe → Think → ... → Finish
 """
 
+import asyncio
+import json
+import queue as _thread_queue
 import re
 import time
 import traceback
+import warnings
+from typing import AsyncGenerator
 
 from core.llm import LLM
 from core.logger import logger
-from core.schema import AgentState, Message, Role, ToolResult
+from core.schema import AgentState, Message, Role, StreamEvent, ToolCall, ToolResult
 from tools.base import ToolRegistry
 
 # Word 相关工具名集合（用于 L1 后校验：自动检查 close_word 是否被遗漏）
@@ -105,12 +110,22 @@ class Agent:
         """
         执行一次完整的 Agent 循环。
 
+        .. deprecated::
+            同步阻塞接口，仅保留向后兼容。
+            新代码请使用 ``async for event in agent.run_async(user_input)``。
+
         Args:
             user_input: 用户的自然语言指令
 
         Returns:
             Agent 的最终回答文本
         """
+        warnings.warn(
+            "Agent.run() 是同步阻塞接口，已废弃。"
+            "请迁移到 run_async() 以获得流式进度和可中断能力。",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         # ── 会话级重置：防止跨轮次状态累积 ──
         self._session_tools = []
         self._session_file = ""
@@ -660,24 +675,34 @@ class Agent:
             self.memory.add_to_vector(user_input, summary)
 
     # ─────────────────────────────────────────────
-    # Skill Config → 工具参数注入
+    # Skill Config → 工具参数注入（Tool-Skill 分离架构）
     # ─────────────────────────────────────────────
 
     # 工具名 → config 中对应的参数键 映射表
     # 定义了哪些 config 键应该注入到哪个工具
     _TOOL_CONFIG_MAP = {
         "inspect_document_format": ["format_rules"],
+        "format_references": ["ref_format_config"],
         "analyze_document": ["acronym_whitelist", "pipeline_order"],
+    }
+
+    # 工具名 → 必须由 Skill 提供的 config 参数
+    # 如果这些参数在注入后仍然缺失，工具将拒绝执行并给出友好提示
+    # 这是 Tool-Skill 分离架构的核心：工具 = 能力(HOW)，Skill = 知识(WHAT)
+    _TOOL_REQUIRED_CONFIG = {
+        "inspect_document_format": ["format_rules"],
     }
 
     def _inject_skill_config(self, tool_name: str, arguments: dict) -> dict:
         """
         将 Skill Config 中的相关参数注入到工具调用中。
 
-        注入原则：
+        注入原则（Tool-Skill 分离架构）：
           - config 参数作为默认值（优先级低于 LLM 显式传参）
           - 只注入 _TOOL_CONFIG_MAP 中声明的参数
           - LLM 已经传递的参数不会被覆盖
+          - _TOOL_REQUIRED_CONFIG 中声明的参数如果缺失，记录警告
+            （工具自身会检测缺失并返回友好错误信息）
 
         Args:
             tool_name: 工具名称
@@ -686,22 +711,31 @@ class Agent:
         Returns:
             注入 config 后的参数字典
         """
-        if not self._active_config:
-            return arguments
-
-        config_keys = self._TOOL_CONFIG_MAP.get(tool_name)
-        if not config_keys:
-            return arguments
-
         injected = dict(arguments)  # 浅拷贝，不修改原始参数
-        for key in config_keys:
-            if key not in injected and key in self._active_config:
-                value = self._active_config[key]
-                if value is not None:  # null 表示显式跳过
-                    injected[key] = value
-                    if self.verbose:
-                        logger.debug("  ⚙️ Skill Config 注入: %s.%s",
-                                     tool_name, key)
+
+        # 注入 Skill config 参数
+        if self._active_config:
+            config_keys = self._TOOL_CONFIG_MAP.get(tool_name)
+            if config_keys:
+                for key in config_keys:
+                    if key not in injected and key in self._active_config:
+                        value = self._active_config[key]
+                        if value is not None:  # null 表示显式跳过
+                            injected[key] = value
+                            if self.verbose:
+                                logger.debug("  ⚙️ Skill Config 注入: %s.%s",
+                                             tool_name, key)
+
+        # 检查必要参数是否就位（仅警告，实际拒绝由工具自身完成）
+        required_keys = self._TOOL_REQUIRED_CONFIG.get(tool_name)
+        if required_keys:
+            missing = [k for k in required_keys if k not in injected]
+            if missing:
+                logger.warning(
+                    "  ⚠️ 工具 %s 缺少必要的 Skill Config 参数: %s "
+                    "— 工具将拒绝执行。请确保用户输入包含触发 Skill 的关键词。",
+                    tool_name, missing
+                )
 
         return injected
 
@@ -716,3 +750,209 @@ class Agent:
         self._session_file = ""
         self._retry_counts = {}
         self._active_config = {}
+
+    async def run_async(self, user_input: str) -> AsyncGenerator[StreamEvent, None]:
+        """
+        异步流式状态机 —— Agent 的心脏。
+
+        整个 Think → Act → Observe 循环被切片为一系列 StreamEvent，
+        通过 async generator 向外 yield。上层消费者（终端 / WebSocket /
+        IDE Bridge）只是"哑终端"，switch-case 事件类型即可渲染。
+
+        关键设计：
+          - LLM 流式响应：async for chunk in stream → yield text delta
+          - 工具执行：asyncio.to_thread + 线程安全 Queue 事件泵
+            工具内部调用 self.report_progress() → 写入 Queue →
+            主循环 poll Queue → yield tool_progress 事件
+          - 随时可中断：调用方 break 即可终止生成器
+        """
+        # ── 会话级重置 ──
+        self._session_tools = []
+        self._session_file = ""
+        self._retry_counts = {}
+        self._active_config = {}
+
+        # ── 向量记忆召回 ──
+        recalled = ""
+        if self.memory:
+            recalled = self.memory.recall_relevant(user_input)
+
+        # ── 技能匹配 + Config 提取 ──
+        skills_ctx = ""
+        if self.skill_manager:
+            matched = self.skill_manager.match(user_input)
+            skills_ctx = self.skill_manager.build_skills_context(matched)
+            self._active_config = self.skill_manager.get_active_config(matched)
+
+        # ── 重建系统提示词（含技能 + 记忆） ──
+        self._build_system_prompt(skills_ctx, recalled)
+
+        from core.prompt import build_l1_user_suffix
+        l1_suffix = build_l1_user_suffix(user_input)
+        augmented_input = user_input + l1_suffix if l1_suffix else user_input
+
+        self.history.append(Message(role=Role.USER, content=augmented_input))
+        self.state = AgentState.THINKING
+
+        openai_tools = self.tools.to_openai_tools()
+
+        # ══════════════════════════════════════════
+        # ReAct 主循环
+        # ══════════════════════════════════════════
+        for step in range(1, self.max_steps + 1):
+            # Token 水位线压缩防爆
+            if self._estimate_tokens() > self._token_warning:
+                self._compress_history()
+
+            self.state = AgentState.THINKING
+
+            # ── 1. LLM 流式推理 ──
+            try:
+                stream = await self.llm.chat_stream(
+                    [m.to_dict() for m in self.history],
+                    tools=openai_tools,
+                )
+            except Exception as e:
+                yield StreamEvent("error", f"LLM 调用失败: {e}")
+                self.state = AgentState.ERROR
+                return
+
+            current_text = ""
+            current_tool_calls = {}
+
+            # ── 2. 流式解析：一边想，一边吐，一边攒工具参数 ──
+            async for chunk in stream:
+                delta = chunk.choices[0].delta
+
+                # 文本增量 → 直接推给 UI 渲染（打字机效果）
+                if delta.content:
+                    current_text += delta.content
+                    yield StreamEvent("text", delta.content)
+
+                # 工具调用增量拼接（不阻塞 UI）
+                if delta.tool_calls:
+                    for tc_chunk in delta.tool_calls:
+                        idx = tc_chunk.index
+                        if idx not in current_tool_calls:
+                            current_tool_calls[idx] = {
+                                "id": tc_chunk.id,
+                                "name": tc_chunk.function.name,
+                                "args": "",
+                            }
+                        if tc_chunk.function.arguments:
+                            current_tool_calls[idx]["args"] += tc_chunk.function.arguments
+
+            # ── 3. 组装 Assistant 消息 ──
+            tool_calls_parsed = []
+            for tc_data in current_tool_calls.values():
+                try:
+                    args = json.loads(tc_data["args"])
+                except json.JSONDecodeError:
+                    args = {"raw": tc_data["args"]}
+                tool_calls_parsed.append(
+                    ToolCall(id=tc_data["id"], name=tc_data["name"], arguments=args)
+                )
+
+            self.history.append(Message(
+                role=Role.ASSISTANT,
+                content=current_text,
+                tool_calls=tool_calls_parsed,
+            ))
+
+            # ══════════════════════════════════════════
+            # 路由：纯文本 → 结束 ／ tool_calls → 执行
+            # ══════════════════════════════════════════
+            if not tool_calls_parsed:
+                self.state = AgentState.FINISHED
+                l1_check = self._post_validate_l1()
+                if l1_check:
+                    yield StreamEvent("error", f"L1 后校验触发: {l1_check}")
+                yield StreamEvent("finish", "任务执行完毕。")
+                self._save_session(user_input, current_text)
+                return
+
+            # ── 4. 工具执行（事件泵模式） ──
+            self.state = AgentState.ACTING
+            for tc in tool_calls_parsed:
+                yield StreamEvent(
+                    "tool_start",
+                    f"正在执行: {tc.name}",
+                    metadata={"tool": tc.name, "args": tc.arguments},
+                )
+
+                # -- 核心：线程安全队列做事件总线 --
+                progress_queue: _thread_queue.Queue = _thread_queue.Queue()
+
+                # 注入进度回调到工具实例
+                tool_obj = self.tools.get(tc.name)
+                if tool_obj is not None:
+                    tool_obj._progress_callback = (
+                        lambda pct, msg, _q=progress_queue: _q.put_nowait((pct, msg))
+                    )
+
+                # 在线程池中执行同步工具（不阻塞事件循环）
+                task = asyncio.create_task(
+                    asyncio.to_thread(self._execute_tool, tc.id, tc.name, tc.arguments)
+                )
+
+                # ── 事件泵：一边等工具完成，一边消费进度队列 ──
+                while not task.done():
+                    await asyncio.sleep(0.1)  # 让出控制权，100ms 轮询
+                    # 排空队列中所有进度事件
+                    while True:
+                        try:
+                            pct, msg = progress_queue.get_nowait()
+                            yield StreamEvent(
+                                "tool_progress",
+                                msg or f"进度 {pct}%",
+                                metadata={"percent": pct, "tool": tc.name},
+                            )
+                        except _thread_queue.Empty:
+                            break
+
+                # 排空工具完成后残留的进度事件
+                while True:
+                    try:
+                        pct, msg = progress_queue.get_nowait()
+                        yield StreamEvent(
+                            "tool_progress",
+                            msg or f"进度 {pct}%",
+                            metadata={"percent": pct, "tool": tc.name},
+                        )
+                    except _thread_queue.Empty:
+                        break
+
+                # 清理回调（防止跨工具泄漏）
+                if tool_obj is not None:
+                    tool_obj._progress_callback = None
+
+                # 获取执行结果
+                try:
+                    result = task.result()
+                    self.history.append(Message(
+                        role=Role.TOOL,
+                        content=result.output,
+                        tool_call_id=result.tool_call_id,
+                        name=result.name,
+                    ))
+                    yield StreamEvent(
+                        "tool_end",
+                        f"{tc.name} 完成",
+                        metadata={"success": result.success, "tool": tc.name},
+                    )
+                except Exception as e:
+                    error_output = f"工具执行崩溃: {e}"
+                    self.history.append(Message(
+                        role=Role.TOOL,
+                        content=error_output,
+                        tool_call_id=tc.id,
+                        name=tc.name,
+                    ))
+                    yield StreamEvent(
+                        "error", error_output,
+                        metadata={"tool": tc.name},
+                    )
+
+        # 超过最大步数熔断
+        self.state = AgentState.ERROR
+        yield StreamEvent("error", f"达到最大步骤上限 ({self.max_steps})，强制停止。")

@@ -2,10 +2,12 @@
 """
 Tool: 文档格式检查器 — Agent 的"格式感知眼镜"
 
-设计哲学：
-  - **只看格式，不输出内容**：每段只显示前 20 字作为定位标记
+设计哲学（Tool-Skill 分离）：
+  - **工具 = 纯能力引擎**：知道 HOW（如何读取和诊断格式），但不知道 WHAT（什么格式是对的）
+  - **Skill = 领域知识**：提供具体的格式规范参数（字体、字号、行距等）
+  - **没有 Skill 注入参数 → 工具无法执行**：天然防止用错误默认值"好心办坏事"
+  - 只看格式，不输出内容：每段只显示前 20 字作为定位标记
   - 将 COM 接口的底层属性翻译为高信息密度的语义化报告
-  - LLM 看到报告后能精准定位格式问题并生成修复代码
 
 与其他工具的职责分离：
   - read_document    → 看内容（纯文本），不看格式
@@ -18,32 +20,16 @@ from tools.base import Tool
 
 
 # ────────────────────────────────────────────
-# 中文学术论文常见格式规范（默认兆底值）
-# ── Skill config 中的 format_rules 会覆盖这里的值 ──
+# 🚫 硬编码格式规范已移除（Tool-Skill 分离架构）
+#
+# 工具本身不再包含任何领域知识（如"宋体""12pt"等具体值）。
+# 所有格式规范参数必须通过 Skill 的 config 块注入。
+#
+# 提供参数的 Skill 文件：
+#   - skills/format_rules_base.md    — 通用中文学术规范（宋体/小四号/1.5倍行距）
+#   - skills/format_rules_sample.md  — 示例特化规范（仿宋/三号/1.25倍行距）
+#   - 用户可自行创建 format_rules_xxx.md 支持任意学校规范
 # ────────────────────────────────────────────
-_ACADEMIC_CN_RULES = {
-    "正文": {
-        "font_cn": "宋体",
-        "font_en": "Times New Roman",
-        "font_size": 12.0,         # 小四号 = 12pt
-        "first_indent_cm": 0.74,   # 2字符 ≈ 0.74cm ≈ 21pt
-        "line_spacing": 1.5,       # 1.5倍行距
-        "alignment": 3,            # 两端对齐 (wdAlignParagraphJustify)
-    },
-    "标题 1": {
-        "font_cn": "黑体",
-        "font_size_min": 15.0,     # 三号 ≈ 16pt, 允许 15-18
-        "font_size_max": 18.0,
-        "bold": True,
-        "alignment": 1,            # 居中
-    },
-    "标题 2": {
-        "font_cn": "黑体",
-        "font_size_min": 13.0,     # 四号 ≈ 14pt
-        "font_size_max": 15.0,
-        "bold": True,
-    },
-}
 
 # 对齐方式常量映射
 _ALIGNMENT_MAP = {
@@ -228,8 +214,16 @@ class InspectDocFormatTool(Tool):
         if not os.path.exists(abs_path):
             return f"文件不存在: {abs_path}"
 
-        # 合并格式规范：外部 format_rules 覆盖默认值，未定义的字段用默认值塬充
-        active_rules = self._merge_format_rules(format_rules)
+        # ── 【物理断头台】format_rules 必须由 Skill 注入，无退路 ──
+        # 不是 return 提示文本（LLM 会无视），而是直接 raise 异常，
+        # 让 Agent 的错误分类器生成不可忽视的结构化修正指令。
+        if not format_rules:
+            raise ValueError(
+                "缺少必须的排版规范参数 (format_rules)。"
+                "请立刻停止盲目执行！你必须向用户追问需要使用的排版规范"
+                "（例如：通用学术规范、张导师专属规范等），获取规范后再执行。"
+            )
+        active_rules = format_rules
 
         # 默认每次查看 20 段
         if end_para == 0:
@@ -541,43 +535,9 @@ class InspectDocFormatTool(Tool):
         except Exception as e:
             return f"格式检查出错: {e}"
 
-    @staticmethod
-    def _merge_format_rules(external_rules: dict | None) -> dict:
-        """
-        合并外部格式规范与内置默认值。
+    # _merge_format_rules() removed: Tool-Skill separation architecture.
 
-        合并策略：
-          - external_rules 中的值覆盖默认值
-          - external_rules 未定义的字段用默认值塬充
-          - 值为 None 的字段表示显式跳过该检查项
+    # format_rules is now fully provided by Skill config.
 
-        Args:
-            external_rules: Skill config 中的 format_rules（可为 None）
+    # Multi-Skill merging is handled by SkillManager.get_active_config().
 
-        Returns:
-            合并后的格式规范字典
-        """
-        from copy import deepcopy
-
-        # 无外部规范 → 直接用默认
-        if not external_rules:
-            return deepcopy(_ACADEMIC_CN_RULES)
-
-        merged = deepcopy(_ACADEMIC_CN_RULES)
-
-        for category, fields in external_rules.items():
-            if not isinstance(fields, dict):
-                continue
-            if category not in merged:
-                # 新增的样式类别（默认值中没有的）
-                merged[category] = deepcopy(fields)
-            else:
-                # 已有的样式类别：逐字段覆盖
-                for field, value in fields.items():
-                    if value is None:
-                        # None 表示“不检查该字段”：从规范中删除
-                        merged[category].pop(field, None)
-                    else:
-                        merged[category][field] = value
-
-        return merged

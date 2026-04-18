@@ -34,9 +34,9 @@ class AnalyzeDocumentTool(Tool):
         if not os.path.exists(abs_path):
             return f"文件不存在: {abs_path}"
 
-        # 缩写白名单：优先用 Skill config 提供的，否则用默认值
-        default_whitelist = {'IEEE', 'ACM', 'DOI', 'HTTP', 'URL', 'PDF', 'USB', 'GPS'}
-        whitelist = set(acronym_whitelist) if acronym_whitelist else default_whitelist
+        # Tool-Skill 分离：acronym_whitelist 由 Skill config 提供
+        # 未提供时使用空集合（不跳过任何缩写），不再硬编码默认白名单
+        whitelist = set(acronym_whitelist) if acronym_whitelist else set()
 
         try:
             import win32com.client
@@ -66,6 +66,8 @@ class AnalyzeDocumentTool(Tool):
             report.append(f"文件: {os.path.basename(abs_path)}")
             report.append(f"总段落数: {total_paras}")
 
+            self.report_progress(10, "文档已打开，开始扫描...")
+
             # ── 检测1：参考文献 ──
             has_refs = False
             ref_count = 0
@@ -87,6 +89,8 @@ class AnalyzeDocumentTool(Tool):
                     break
                 body_text += text + "\n"
             ref_citations_in_body = len(re.findall(r'\[\d+\]', body_text))
+
+            self.report_progress(30, "参考文献扫描完成")
 
             if has_refs:
                 report.append(f"\n[参考文献] 已检测到参考文献章节")
@@ -121,6 +125,8 @@ class AnalyzeDocumentTool(Tool):
                     except Exception:
                         pass
 
+            self.report_progress(55, "图注检测完成")
+
             report.append(f"\n[图注]")
             report.append(f"  - 手写图注: {handwritten_captions} 个")
             report.append(f"  - Word题注(SEQ域): {word_captions} 个")
@@ -137,6 +143,8 @@ class AnalyzeDocumentTool(Tool):
                 text = doc.Paragraphs(i).Range.Text
                 latex_inline += len(re.findall(r'(?<!\$)\$(?!\$).+?\$(?!\$)', text))
                 latex_block += len(re.findall(r'\$\$.+?\$\$', text))
+
+            self.report_progress(75, "LaTeX 公式扫描完成")
 
             report.append(f"\n[LaTeX公式]")
             if latex_inline + latex_block > 0:
@@ -156,6 +164,8 @@ class AnalyzeDocumentTool(Tool):
                 report.append(f"  - 示例: {', '.join(sample)}")
                 report.append(f"  - 建议: 可执行 check_acronym_definitions")
 
+            self.report_progress(90, "缩写词检测完成")
+
             # ── 提示 Agent 根据 Skill 决定下一步 ──
             report.append(f"\n=== 下一步 ===")
             report.append(f"请根据以上检测结果，结合你已加载的技能手册，决定执行哪些工具。")
@@ -164,6 +174,7 @@ class AnalyzeDocumentTool(Tool):
             if opened_by_us:
                 doc.Close(SaveChanges=0)
 
+            self.report_progress(100, "分析完成")
             return "\n".join(report)
 
         except Exception as e:
