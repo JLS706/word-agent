@@ -18,6 +18,7 @@ class StreamEvent:
         - "tool_start"     : 工具开始执行（metadata 含 tool, args）
         - "tool_progress"  : 工具执行中的进度更新（metadata 含 percent, tool）
         - "tool_end"       : 工具执行完毕（metadata 含 success, tool）
+        - "tool_timeout"   : 工具心跳停滞熔断（metadata 含 stall_seconds, killed_pids, tool）
         - "error"          : 发生错误
         - "finish"         : 本轮任务结束
 

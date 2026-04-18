@@ -56,7 +56,9 @@ class FigCrossRefTool(Tool):
 
         # D+C 一起执行：D 生成 draft_fig_map，C 使用它来映射草稿编号
         stages = {'A': False, 'B': False, 'C': True, 'D': True, 'E': False}
+        self.report_progress(10, "开始处理图注交叉引用...")
         mod.process_document(file_path, modify_in_place=modify_in_place, stages=stages)
+        self.report_progress(90, "图注交叉引用生成完成")
 
         output_path = _get_output_path(file_path, modify_in_place)
         return (

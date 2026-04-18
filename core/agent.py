@@ -89,8 +89,15 @@ class Agent:
             if self.memory else ""
         )
 
+        # ── 自动探测人设：有 delegate_task 工具 → Coordinator，否则 Executor ──
+        # 主 Agent 的 registry 注册了 delegate_task → 自动成为 Coordinator
+        # Worker 的 registry 经 exclude({"delegate_task"}) 过滤 → 自动成为 Executor
+        is_coordinator = self.tools.get("delegate_task") is not None
+
         # ── 静态根（跨轮次不变 → 缓存命中）──
-        static_content = build_static_system_prompt(tool_desc)
+        static_content = build_static_system_prompt(
+            tool_desc, is_coordinator=is_coordinator
+        )
         static_msg = Message(role=Role.SYSTEM, content=static_content)
 
         # ── 动态叶（每轮可变 → 独立消息，不污染前缀）──
@@ -871,7 +878,7 @@ class Agent:
                 self._save_session(user_input, current_text)
                 return
 
-            # ── 4. 工具执行（事件泵模式） ──
+            # ── 4. 工具执行（心跳事件泵模式） ──
             self.state = AgentState.ACTING
             for tc in tool_calls_parsed:
                 yield StreamEvent(
@@ -880,28 +887,45 @@ class Agent:
                     metadata={"tool": tc.name, "args": tc.arguments},
                 )
 
-                # -- 核心：线程安全队列做事件总线 --
+                # -- 核心：线程安全队列 + asyncio.Event 信号驱动 --
                 progress_queue: _thread_queue.Queue = _thread_queue.Queue()
+                wake_event = asyncio.Event()  # 工具线程有新数据时唤醒事件泵
+                loop = asyncio.get_running_loop()
 
-                # 注入进度回调到工具实例
+                # 注入进度回调：put 数据后跨线程 set event 唤醒泵
                 tool_obj = self.tools.get(tc.name)
                 if tool_obj is not None:
-                    tool_obj._progress_callback = (
-                        lambda pct, msg, _q=progress_queue: _q.put_nowait((pct, msg))
-                    )
+                    def _progress_cb(pct, msg, _q=progress_queue, _ev=wake_event, _loop=loop):
+                        _q.put_nowait((pct, msg))
+                        _loop.call_soon_threadsafe(_ev.set)
+                    tool_obj._progress_callback = _progress_cb
 
                 # 在线程池中执行同步工具（不阻塞事件循环）
                 task = asyncio.create_task(
                     asyncio.to_thread(self._execute_tool, tc.id, tc.name, tc.arguments)
                 )
+                # task 完成时也唤醒泵（防止 task 在 wait 期间结束但泵在睡觉）
+                task.add_done_callback(lambda _: wake_event.set())
 
-                # ── 事件泵：一边等工具完成，一边消费进度队列 ──
+                # ── 信号驱动事件泵（非 busy-polling） ──
+                STALL_TIMEOUT = 5.0  # 心跳停滞阈值（秒）
+                last_heartbeat = time.time()
+                stall_killed = False
+
                 while not task.done():
-                    await asyncio.sleep(0.1)  # 让出控制权，100ms 轮询
-                    # 排空队列中所有进度事件
+                    # 挂起等待：工具线程 set event 或超时（=心跳截止时间）
+                    remaining = max(0.05, STALL_TIMEOUT - (time.time() - last_heartbeat))
+                    try:
+                        await asyncio.wait_for(wake_event.wait(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        pass  # 超时 → 下面做心跳检测
+                    wake_event.clear()
+
+                    # 排空队列中所有进度事件 & 刷新心跳
                     while True:
                         try:
                             pct, msg = progress_queue.get_nowait()
+                            last_heartbeat = time.time()  # 心跳续命
                             yield StreamEvent(
                                 "tool_progress",
                                 msg or f"进度 {pct}%",
@@ -909,6 +933,52 @@ class Agent:
                             )
                         except _thread_queue.Empty:
                             break
+
+                    # ── 心跳停滞检测 ──
+                    stall_sec = time.time() - last_heartbeat
+                    if stall_sec > STALL_TIMEOUT:
+                        # 精准击杀僵尸 Word 进程（从类级别 PID 注册表获取）
+                        from core.com_watchdog import COMSafeLock
+                        active_pids = COMSafeLock.get_active_pids()
+                        killed = COMSafeLock.kill_pids(active_pids) if active_pids else []
+
+                        # 取消 asyncio task（工具线程会因进程被杀而抛异常）
+                        task.cancel()
+                        try:
+                            await task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+
+                        # 结构化错误回注历史，唤醒 LLM 大脑
+                        timeout_msg = (
+                            f"❌ 工具 {tc.name} 执行进度卡死超过 {STALL_TIMEOUT:.0f} 秒，"
+                            f"底层进程已强制熔断（击杀 PID: {killed or '未知'}）。\n"
+                            f"可能原因：Word 弹出了隐藏对话框导致 COM 死锁。\n"
+                            f"请尝试：1) 重新调用该工具 2) 换一种参数 3) 跳过此步骤"
+                        )
+                        self.history.append(Message(
+                            role=Role.TOOL,
+                            content=timeout_msg,
+                            tool_call_id=tc.id,
+                            name=tc.name,
+                        ))
+                        yield StreamEvent(
+                            "tool_timeout",
+                            timeout_msg,
+                            metadata={
+                                "tool": tc.name,
+                                "stall_seconds": round(stall_sec, 1),
+                                "killed_pids": killed,
+                            },
+                        )
+                        stall_killed = True
+                        break  # 跳出事件泵循环
+
+                if stall_killed:
+                    # 清理回调，继续下一轮 ReAct（LLM 读到错误后决定下一步）
+                    if tool_obj is not None:
+                        tool_obj._progress_callback = None
+                    continue  # 跳过本 tool_call 的结果处理，回到 for tc 循环
 
                 # 排空工具完成后残留的进度事件
                 while True:

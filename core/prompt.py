@@ -66,6 +66,66 @@ SYSTEM_PROMPT_STATIC = """\
 {learned_rules_reminder}
 """
 
+# ══════════════════════════════════════════════
+# Coordinator — 蜂群指挥官（Star-Shaped Swarm Mode）
+# 当 registry 中存在 delegate_task 工具时自动激活此人设
+# ══════════════════════════════════════════════
+COORDINATOR_PROMPT_STATIC = """\
+你是 DocMaster 的 Coordinator（协调器 / 蜂群指挥官），运行在用户的 Windows 电脑上。
+
+{learned_rules_context}
+
+## 你的核心身份
+
+你是一个**调度者**，不是执行者。你的职责是：
+1. 理解用户的复杂需求
+2. 将需求拆解为若干可委派的原子子任务
+3. 通过 `delegate_task` 工具派发给专业 Worker（Planner / Executor / Reviewer / Preprocessor）
+4. 收集各 Worker 返回的结构化 JSON 报告
+5. 综合各方报告后，用清晰简洁的自然语言向用户汇报
+
+## 何时自己动手 vs 何时委派
+
+| 场景 | 策略 |
+|---|---|
+| 单一只读查询（如"读文档结构"） | 直接调用 `read_document` 等工具 |
+| 简单单次写入（如"只格式化参考文献"） | 直接调用对应工具 |
+| **复杂多步任务**（如"完整排版论文"） | 分解为多个 Worker，并行/串行派发 |
+| **需要独立窗口的审查任务**（如"逐页审查 100 段格式"） | 派发给 Reviewer Worker |
+| 产生大量中间日志的任务 | 派发给 Worker（日志随 Worker 销毁） |
+
+## 委派铁律
+
+调用 `delegate_task` 时必须明确三要素：
+- `role`: Planner / Executor / Reviewer / Preprocessor（**决定 Worker 行为模式**）
+- `objective`: 单一明确的目标（**一句话能讲清楚**）
+- `target_file`: 文件绝对路径
+
+Worker 执行完成后会返回结构化 JSON 报告（含 `status`、`summary`、`output_path`、
+`issues_found`、`actions_taken`）。你只看到这份清爽报告，Worker 的内部垃圾日志
+永远不会污染你的上下文。
+
+## 你能使用的工具
+
+{tool_descriptions}
+
+## 行为准则
+
+1. **优先考虑委派**：面对复杂任务时，先思考能否拆解为 Worker 子任务
+2. **清晰汇报**：综合多份 Worker 报告，给用户一份易读的总结（而非堆砌 JSON）
+3. **失败处理**：如果某个 Worker 返回 status=FAIL，判断是重派、改派别的角色，
+   还是向用户报错
+4. **安全第一**：Worker 在隔离工作区执行，只有 status=PASS 才会回写原文件
+5. **🧠 L1 强制认知回显**：每次调用工具前，先在思考中默写相关 L1 规则
+6. **核心规则人类独占**：不能自行 `save_learned_rule`，必须用户明确确认后才能执行
+
+## 语言偏好
+
+请使用中文与用户交流。
+{learned_rules_reminder}
+"""
+
+
 # ── 动态叶：每轮可变的上下文，作为独立消息不污染静态根的缓存 ──
 DYNAMIC_CONTEXT_TEMPLATE = """\
 ## 本轮上下文
@@ -228,12 +288,18 @@ def _load_l1_sections() -> tuple[str, str]:
     return learned_section, reminder
 
 
-def build_static_system_prompt(tool_descriptions: str) -> str:
+def build_static_system_prompt(tool_descriptions: str,
+                                is_coordinator: bool = False) -> str:
     """
     构建静态系统提示词（Prompt Cache 友好）。
 
     只包含跨轮次不变的内容：L1 规则、工具描述、行为准则。
     不包含每轮变化的 skills/memory，它们由 build_dynamic_context() 单独提供。
+
+    Args:
+        tool_descriptions: 工具列表描述
+        is_coordinator: 是否使用 Coordinator 人设（蜂群指挥官）。
+            通常由 Agent 根据 registry 中是否存在 delegate_task 自动探测。
 
     💡 设计原理：
       大模型 API 的 Prompt Cache 匹配的是 Token 序列的最长公共前缀。
@@ -241,8 +307,9 @@ def build_static_system_prompt(tool_descriptions: str) -> str:
       获得 50%~90% 的输入 Token 降价和低延迟。
     """
     learned_section, reminder = _load_l1_sections()
+    template = COORDINATOR_PROMPT_STATIC if is_coordinator else SYSTEM_PROMPT_STATIC
 
-    return SYSTEM_PROMPT_STATIC.format(
+    return template.format(
         tool_descriptions=tool_descriptions,
         learned_rules_context=learned_section,
         learned_rules_reminder=reminder,
@@ -292,45 +359,144 @@ def build_system_prompt(tool_descriptions: str, memory_context: str = "",
     return static
 
 
-def build_planner_prompt(tool_descriptions: str, memory_context: str = "") -> str:
-    """构建 Planner 角色的系统提示词"""
-    mem_section = ""
-    if memory_context:
-        mem_section = f"## 历史记忆\n\n{memory_context}"
-    return PLANNER_PROMPT.format(
-        tool_descriptions=tool_descriptions,
-        memory_context=mem_section,
+# ══════════════════════════════════════════════
+# Worker — 被 Coordinator 派发的无状态子 Agent
+#
+# 架构：role-specific 基础 Prompt + 通用 Swarm 后缀
+#   - 基础 Prompt：根据 role 派发 PLANNER / REVIEWER / PREPROCESSOR / 通用
+#   - Swarm 后缀：所有 Worker 共享的铁律（JSON 报告、无 delegate_task、
+#     modify_in_place=True、close_word）
+# ══════════════════════════════════════════════
+
+# 通用 Worker 基础 Prompt（当 role 无法匹配专业角色时使用，如 "Executor"）
+GENERIC_WORKER_BASE = """\
+你是 DocMaster 的 Worker（工作线程），被 Coordinator（主调度器）派发了一个子任务。
+
+## 你的身份
+角色: {role}
+
+## 你能使用的工具
+
+{tool_descriptions}
+"""
+
+
+# 所有 Worker 共享的 Swarm 后缀（插入到任何基础 Prompt 之后）
+SWARM_WORKER_SUFFIX = """\
+
+---
+
+## 🐝 Swarm 铁律（所有 Worker 共同遵守）
+
+### 你的本轮任务上下文
+- **目标 (Objective)**：{objective}
+- **目标文件 (Target File)**：{target_file}
+
+### 铁律
+
+1. **专注单一目标**：你只负责完成上述 Objective，不要做任何超出目标范围的事情。
+2. **你没有 delegate_task 工具**：你不能派发子任务，你只能亲自动手干活。
+3. **完成后立即汇报**：任务结束时，你必须输出一份结构化 JSON 报告作为最终回答：
+   ```json
+   {{
+     "status": "PASS 或 FAIL",
+     "summary": "一句话总结完成情况",
+     "output_path": "实际产出文件的绝对路径（默认就是上方【目标文件】路径）",
+     "issues_found": ["问题1", "问题2"],
+     "actions_taken": ["操作1", "操作2"]
+   }}
+   ```
+4. **不要闲聊**：任务结束后直接输出 JSON，不要在 JSON 前后附加任何说明文字。
+5. **Word 相关操作完成后必须调用 close_word 释放进程。**
+6. **写入工具必须 modify_in_place=True**：调用任何会修改文档的工具（如
+   `format_references`、`create_reference_crossrefs`、`create_figure_crossrefs`、
+   `convert_handwritten_captions`、`convert_latex_to_mathtype`）时，
+   `modify_in_place` 参数必须传 `True`。所有改动必须落在【目标文件】上，
+   **严禁生成 `_processed.docx` 等衍生文件**。若确实必须生成衍生文件，
+   必须在 JSON 报告的 `output_path` 字段如实填写该绝对路径。
+"""
+
+
+def build_worker_prompt(
+    role: str,
+    objective: str,
+    target_file: str,
+    tool_descriptions: str,
+) -> str:
+    """
+    构建被 Coordinator 派发的 Worker 子 Agent 的系统提示词。
+
+    按 role 派发到对应的专业 Prompt（Planner/Reviewer/Preprocessor），
+    并追加所有 Worker 共享的 Swarm 后缀（JSON 报告、无 delegate_task 等铁律）。
+
+    支持的 role（大小写不敏感）：
+      - "Planner"      → PLANNER_PROMPT（规划、只读工具）
+      - "Reviewer"     → REVIEWER_PROMPT（审查、L1 宪法守门）
+      - "Preprocessor" → PREPROCESSOR_PROMPT（文本清洗、结构推演）
+      - 其他（如 "Executor"） → GENERIC_WORKER_BASE（通用工具执行者）
+
+    Args:
+        role: Worker 的角色身份
+        objective: 本次任务的具体目标
+        target_file: 目标文件绝对路径（工作区内副本）
+        tool_descriptions: Worker 可用工具列表描述
+
+    Returns:
+        拼接后的完整系统提示词
+    """
+    role_key = (role or "").strip().lower()
+
+    # ── 1. 按 role 选择基础 Prompt ──
+    if role_key == "planner":
+        base = PLANNER_PROMPT.format(
+            tool_descriptions=tool_descriptions,
+            memory_context="",  # Worker 无记忆
+        )
+    elif role_key == "reviewer":
+        # Reviewer 需要 L1 宪法段落（复用 build_reviewer_prompt 的逻辑）
+        l1_section = ""
+        try:
+            from tools.learned_rules import _load_rules
+            rules = _load_rules()
+            if rules:
+                rule_lines = "\n".join(
+                    f"{i}. **{r['rule']}**" for i, r in enumerate(rules, 1)
+                )
+                l1_section = (
+                    "## 🔒 L1 宪法（最高审查标准）\n\n"
+                    "以下核心规则具有一票否决权。任何违规都必须在报告中标记为 ❌ 失败项。\n\n"
+                    f"{rule_lines}"
+                )
+        except Exception:
+            pass
+        base = REVIEWER_PROMPT.format(
+            tool_descriptions=tool_descriptions,
+            l1_constitutional_section=l1_section,
+        )
+    elif role_key == "preprocessor":
+        base = PREPROCESSOR_PROMPT.format(
+            tool_descriptions=tool_descriptions,
+        )
+    else:
+        # 兜底：Executor 或任何未知 role
+        base = GENERIC_WORKER_BASE.format(
+            role=role or "Executor",
+            tool_descriptions=tool_descriptions,
+        )
+
+    # ── 2. 追加 Swarm 后缀（所有 Worker 共享铁律）──
+    suffix = SWARM_WORKER_SUFFIX.format(
+        objective=objective,
+        target_file=target_file,
     )
 
-
-def build_preprocessor_prompt(tool_descriptions: str) -> str:
-    """构建 Preprocessor 角色的系统提示词（用于无结构纯文本的预处理）"""
-    return PREPROCESSOR_PROMPT.format(
-        tool_descriptions=tool_descriptions,
-    )
+    return base + suffix
 
 
-def build_reviewer_prompt(tool_descriptions: str) -> str:
-    """构建 Reviewer 角色的系统提示词（含 L1 宪法审查）"""
-    # Reviewer 的上下文极短、注意力高度集中，是 L1 的最佳守门人
-    l1_section = ""
-    try:
-        from tools.learned_rules import _load_rules
-        rules = _load_rules()
-        if rules:
-            rule_lines = "\n".join(f"{i}. **{r['rule']}**" for i, r in enumerate(rules, 1))
-            l1_section = (
-                "## 🔒 L1 宪法（最高审查标准）\n\n"
-                "以下核心规则具有一票否决权。Executor 的任何违规都必须在报告中标记为 ❌ 失败项。\n\n"
-                f"{rule_lines}"
-            )
-    except Exception:
-        pass
-
-    return REVIEWER_PROMPT.format(
-        tool_descriptions=tool_descriptions,
-        l1_constitutional_section=l1_section,
-    )
+# 注：历史上的 build_planner_prompt / build_preprocessor_prompt / build_reviewer_prompt
+# 三个独立函数已被 build_worker_prompt() 通过 role 派发统一吸收，不再单独暴露。
+# 底层的 PLANNER_PROMPT / REVIEWER_PROMPT / PREPROCESSOR_PROMPT 模板仍然是
+# Worker 专业化行为的领域知识来源。
 
 
 USER_PROMPT_TEMPLATE = """\

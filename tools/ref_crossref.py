@@ -54,7 +54,9 @@ class RefCrossRefTool(Tool):
         spec.loader.exec_module(mod)
 
         stages = {'A': False, 'B': True, 'C': False, 'D': False, 'E': False}
+        self.report_progress(10, "开始生成文献交叉引用...")
         mod.process_document(file_path, modify_in_place=modify_in_place, stages=stages)
+        self.report_progress(90, "文献交叉引用生成完成")
 
         output_path = _get_output_path(file_path, modify_in_place)
         return (

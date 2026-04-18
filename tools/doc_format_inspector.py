@@ -252,6 +252,7 @@ class InspectDocFormatTool(Tool):
                 opened_by_us = False
 
             total_paras = doc.Paragraphs.Count
+            self.report_progress(10, "文档已打开，开始格式检查...")
 
             # 修正范围
             start_para = max(1, start_para)
@@ -272,7 +273,12 @@ class InspectDocFormatTool(Tool):
             issue_ok = 0        # 🟢 正常
 
             # ── 逐段落检查 ──
+            check_span = end_para - start_para + 1
             for i in range(start_para, end_para + 1):
+                # 每检查 5 段发一次心跳（防止大文档超时）
+                if (i - start_para) % 5 == 0:
+                    pct = 10 + int(80 * (i - start_para) / max(check_span, 1))
+                    self.report_progress(pct, f"检查段落 {i}/{end_para}")
                 para = doc.Paragraphs(i)
                 rng = para.Range
 
@@ -527,9 +533,11 @@ class InspectDocFormatTool(Tool):
                     f"start_para={end_para + 1}) 查看下一页。"
                 )
 
+            self.report_progress(95, "格式检查完成")
             if opened_by_us:
                 doc.Close(SaveChanges=0)
 
+            self.report_progress(100, "完成")
             return "\n".join(report)
 
         except Exception as e:

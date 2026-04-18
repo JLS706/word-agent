@@ -55,7 +55,9 @@ class FigCaptionTool(Tool):
         spec.loader.exec_module(mod)
 
         stages = {'A': False, 'B': False, 'C': False, 'D': True, 'E': False}
+        self.report_progress(10, "开始转换手写图注...")
         mod.process_document(file_path, modify_in_place=modify_in_place, stages=stages)
+        self.report_progress(90, "手写图注转换完成")
 
         output_path = _get_output_path(file_path, modify_in_place)
         return (

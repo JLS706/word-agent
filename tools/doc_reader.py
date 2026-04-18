@@ -82,6 +82,7 @@ class DocReaderTool(Tool):
                 opened_by_us = False
 
             total_paras = doc.Paragraphs.Count
+            self.report_progress(20, "文档已打开")
             result_lines = []
             result_lines.append(f"[文档信息] 文件: {os.path.basename(abs_path)}")
             result_lines.append(f"[文档信息] 总段落数: {total_paras}")
@@ -150,10 +151,12 @@ class DocReaderTool(Tool):
                         f"仅显示前{max_paragraphs}段)"
                     )
 
+            self.report_progress(90, "内容提取完成")
             # 不关闭我们没打开的文档
             if opened_by_us:
                 doc.Close(SaveChanges=0)
 
+            self.report_progress(100, "读取完成")
             return "\n".join(result_lines)
 
         except Exception as e:

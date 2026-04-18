@@ -1,23 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-DocMaster Agent — FastAPI Web 接口层
+DocMaster Agent — FastAPI Web 接口层（SSE 流式版）
 
-将命令行 Agent 包装为 HTTP 服务，为后续 Docker 容器化做准备。
+将命令行 Agent 包装为 HTTP 服务，支持 Server-Sent Events 实时推送。
 
 启动方式:
     python api.py
 
 接口:
-    POST /chat    — 对话（发送指令，获取 Agent 回复）
-    GET  /health  — 健康检查
-    GET  /tools   — 查看可用工具列表
+    POST /chat/stream  — SSE 流式对话（实时推送 StreamEvent）
+    POST /chat         — 兼容接口（阻塞式，已废弃）
+    GET  /health       — 健康检查
+    GET  /tools        — 查看可用工具列表
 """
 
+import json
 import os
 import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 # 确保项目根目录在 sys.path 中
@@ -32,7 +35,6 @@ from tools.base import ToolRegistry
 # ─────────────────────────────────────────────
 
 agent_instance: Agent | None = None
-orchestrator_instance = None
 tool_registry: ToolRegistry | None = None
 
 
@@ -47,16 +49,14 @@ async def lifespan(app: FastAPI):
     这是 FastAPI 推荐的初始化方式（替代 @app.on_event）。
     复用 main.py 的初始化逻辑，确保工具注册与 CLI 完全一致。
     """
-    global agent_instance, orchestrator_instance, tool_registry
+    global agent_instance, tool_registry
 
     from main import load_config, create_agent
 
     print("[*] 正在初始化 Agent（复用 main.py 完整初始化逻辑）...")
     config = load_config()
-    agent, orchestrator = create_agent(config)
-    agent_instance = agent
-    orchestrator_instance = orchestrator
-    tool_registry = agent.tools
+    agent_instance = create_agent(config)
+    tool_registry = agent_instance.tools
     print(f"[OK] Agent 就绪，已加载 {len(tool_registry)} 个工具")
 
     yield  # ← 应用运行中
@@ -133,23 +133,73 @@ def list_tools():
     return tools
 
 
-@app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest):
     """
-    对话接口 — 发送自然语言指令，Agent 执行后返回结果。
+    SSE 流式对话接口 — 实时推送 Agent 的 StreamEvent。
 
-    示例请求:
-        POST /chat
-        {"message": "帮我格式化参考文献"}
+    每个 SSE 消息格式:
+        event: {event_type}
+        data: {json_payload}
+
+    前端消费示例 (JavaScript):
+        const es = new EventSource('/chat/stream', { method: 'POST', body: ... });
+        es.addEventListener('text', (e) => appendToUI(JSON.parse(e.data).content));
+        es.addEventListener('tool_progress', (e) => updateProgressBar(JSON.parse(e.data)));
+        es.addEventListener('finish', () => es.close());
+    """
+    if agent_instance is None:
+        async def error_gen():
+            yield f"event: error\ndata: {json.dumps({'content': 'Agent 未初始化'}, ensure_ascii=False)}\n\n"
+        return StreamingResponse(error_gen(), media_type="text/event-stream")
+
+    async def event_generator():
+        agent_instance.reset()
+        try:
+            async for event in agent_instance.run_async(req.message):
+                payload = json.dumps({
+                    "type": event.type,
+                    "content": event.content,
+                    "metadata": event.metadata,
+                }, ensure_ascii=False)
+                yield f"event: {event.type}\ndata: {payload}\n\n"
+        except Exception as e:
+            error_payload = json.dumps({
+                "type": "error",
+                "content": f"Agent 执行崩溃: {e}",
+                "metadata": {},
+            }, ensure_ascii=False)
+            yield f"event: error\ndata: {error_payload}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # 禁止 Nginx 缓冲
+        },
+    )
+
+
+@app.post("/chat", response_model=ChatResponse, deprecated=True)
+async def chat(req: ChatRequest):
+    """
+    兼容接口（已废弃）— 阻塞式调用，建议迁移到 /chat/stream。
+
+    内部已改用 run_async() 驱动，但仍然是等全部完成后一次性返回。
+    对于耗时超过 60s 的任务，网关可能会 504 超时。
     """
     if agent_instance is None:
         return ChatResponse(reply="Agent 未初始化", success=False)
 
     try:
-        # 重置 Agent（每次请求是独立的对话）
         agent_instance.reset()
-        reply = agent_instance.run(req.message)
-        return ChatResponse(reply=reply, success=True)
+        final_text = ""
+        async for event in agent_instance.run_async(req.message):
+            if event.type == "text":
+                final_text += event.content
+        return ChatResponse(reply=final_text or "任务完成", success=True)
     except Exception as e:
         return ChatResponse(reply=f"Agent 执行失败: {e}", success=False)
 

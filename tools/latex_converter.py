@@ -53,9 +53,12 @@ class LatexConverterTool(Tool):
                 sys.argv.append("--overwrite")
             else:
                 sys.argv.append("--safe")
+            self.report_progress(5, "开始 LaTeX→MathType 转换（耗时较长）...")
             spec.loader.exec_module(mod)
             mod.main()
+            self.report_progress(95, "LaTeX 转换完成")
         finally:
             sys.argv = original_argv
 
+        self.report_progress(100, "完成")
         return f"✅ LaTeX→MathType 转换完成。文件: {os.path.basename(file_path)}"

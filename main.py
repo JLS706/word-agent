@@ -60,11 +60,10 @@ def load_config() -> dict:
 
 
 def create_agent(config: dict, dry_run: bool = False):
-    """根据配置创建 Agent 实例和 Multi-Agent 编排器"""
+    """根据配置创建 Coordinator Agent 实例（蜂群模式，Worker 由 delegate_task 按需 fork）"""
     from core.llm import LLM
     from core.agent import Agent
     from core.memory import Memory
-    from core.multi_agent import MultiAgentOrchestrator
     from tools.base import ToolRegistry
 
     # 导入所有工具
@@ -85,11 +84,11 @@ def create_agent(config: dict, dry_run: bool = False):
     from tools.doc_summarizer import SummarizeDocumentTool
     from tools.doc_format_inspector import InspectDocFormatTool
     from tools.word_cleanup import CloseWordTool
-    from tools.pipeline_tool import RunPipelineTool, set_orchestrator
     from tools.tool_creator import (
         CreateToolTool, ApproveToolTool, RejectToolTool, ListCustomToolsTool,
         load_custom_tools,
     )
+    from tools.delegate import DelegateTaskTool
 
     # 初始化 LLM
     llm_config = config.get("llm", {})
@@ -136,7 +135,10 @@ def create_agent(config: dict, dry_run: bool = False):
     registry.register(ApproveToolTool(registry))      # 工具审批激活
     registry.register(RejectToolTool())                # 工具否决销毁
     registry.register(ListCustomToolsTool())          # 列出自定义工具
-    registry.register(RunPipelineTool())               # Multi-Agent 流水线触发
+
+    # 🐝 蜂群派发器：只有 Coordinator（主 Agent）拥有此工具
+    # Worker 通过 registry.exclude({"delegate_task"}) 获得无此工具的子集
+    registry.register(DelegateTaskTool(llm, registry))  # 星型协调器核心
 
     # 自动加载已审批的自定义工具
     custom_count = load_custom_tools(registry)
@@ -151,7 +153,7 @@ def create_agent(config: dict, dry_run: bool = False):
                 len(skill_manager.skills),
                 [s.name for s in skill_manager.skills])
 
-    # 创建 Executor Agent
+    # 创建 Coordinator Agent（registry 含 delegate_task 时自动激活蜂群指挥官人设）
     agent_config = config.get("agent", {})
 
     # 根据配置调整日志级别
@@ -169,20 +171,7 @@ def create_agent(config: dict, dry_run: bool = False):
         skill_manager=skill_manager,
     )
 
-    # 创建 Multi-Agent 编排器
-    orchestrator = MultiAgentOrchestrator(
-        llm=llm,
-        executor_agent=agent,
-        tool_registry=registry,
-        memory=memory,
-        verbose=agent_config.get("verbose", True),
-        checkpoint_dir=os.path.join(PROJECT_ROOT, "checkpoints"),
-    )
-
-    # 注入 orchestrator 到 pipeline_tool（让 Agent 可以自主调用流水线）
-    set_orchestrator(orchestrator)
-
-    return agent, orchestrator
+    return agent
 
 
 def test_connection(config: dict):
@@ -204,7 +193,7 @@ def test_connection(config: dict):
         traceback.print_exc()
 
 
-async def interactive_loop_async(agent, orchestrator=None):
+async def interactive_loop_async(agent):
     """异步交互循环：实时消费 Agent 发射的 StreamEvent"""
     print("\n" + "=" * 60)
     print("  🤖 DocMaster Agent [异步流式引擎版]")
@@ -247,6 +236,10 @@ async def interactive_loop_async(agent, orchestrator=None):
                 elif event.type == "tool_end":
                     # 清除进度条行，打印完成状态
                     print(f"\r  ✅ {event.content}" + " " * 40, flush=True)
+                elif event.type == "tool_timeout":
+                    # 心跳停滞熔断：清除进度条，打印醒目警告
+                    stall = event.metadata.get("stall_seconds", "?")
+                    print(f"\r  ⏰ 进度卡死 {stall}s，已强制熔断" + " " * 30, flush=True)
                 elif event.type == "error":
                     print(f"\n[❌ 错误] {event.content}", flush=True)
                 elif event.type == "finish":
@@ -259,10 +252,10 @@ async def interactive_loop_async(agent, orchestrator=None):
 async def main_async():
     # 你的参数解析等逻辑...
     config = load_config()
-    agent, orchestrator = create_agent(config) # 这里恢复正常
+    agent = create_agent(config)
     
     # 启动异步交互循环
-    await interactive_loop_async(agent, orchestrator)
+    await interactive_loop_async(agent)
 
 if __name__ == "__main__":
     # 使用 asyncio.run 启动整个异步系统

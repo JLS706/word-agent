@@ -95,6 +95,23 @@ class ToolRegistry:
         """将所有工具转为 OpenAI function calling 格式"""
         return [tool.to_openai_tool() for tool in self._tools.values()]
 
+    def subset(self, names: set[str]) -> "ToolRegistry":
+        """创建仅包含指定工具的子注册表（白名单）。用于子 Agent 工具权限隔离。"""
+        child = ToolRegistry()
+        for name in names:
+            tool = self._tools.get(name)
+            if tool:
+                child._tools[name] = tool
+        return child
+
+    def exclude(self, names: set[str]) -> "ToolRegistry":
+        """创建排除指定工具的子注册表（黑名单）。用于防止子 Agent 调用 delegate_task 等。"""
+        child = ToolRegistry()
+        for name, tool in self._tools.items():
+            if name not in names:
+                child._tools[name] = tool
+        return child
+
     def describe(self) -> str:
         """生成所有工具的文字描述（用于日志/调试）"""
         lines = []

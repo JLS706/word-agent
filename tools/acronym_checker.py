@@ -46,7 +46,9 @@ class AcronymCheckerTool(Tool):
         try:
             sys.stdout = captured
             stages = {'A': False, 'B': False, 'C': False, 'D': False, 'E': True}
+            self.report_progress(10, "开始检测缩写定义...")
             mod.process_document(file_path, modify_in_place=False, stages=stages)
+            self.report_progress(90, "缩写检测完成")
         finally:
             sys.stdout = old_stdout
 

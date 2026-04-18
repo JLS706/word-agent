@@ -131,6 +131,8 @@ class SummarizeDocumentTool(BaseTool):
         if not text.strip():
             return "文档内容为空"
 
+        self.report_progress(10, "文档读取完成")
+
         # 如果文档够短（<2000字），直接返回全文让 LLM 处理
         if len(text) < 2000:
             return f"[文档较短，直接返回全文]\n\n{text}"
@@ -153,6 +155,8 @@ class SummarizeDocumentTool(BaseTool):
 
         mini_summaries = []
         for i, chunk in enumerate(chunks):
+            pct = 15 + int(60 * i / max(len(chunks), 1))
+            self.report_progress(pct, f"Map {i+1}/{len(chunks)}")
             logger.debug("  Map %d/%d (%d 字)...", i + 1, len(chunks), len(chunk))
             messages = [
                 Message(role=Role.SYSTEM, content=(
@@ -170,6 +174,7 @@ class SummarizeDocumentTool(BaseTool):
                 mini_summaries.append(f"[段落 {i+1}] (摘要生成失败: {e})")
 
         # ── Reduce 阶段：合成总结 ──
+        self.report_progress(80, "Reduce 阶段：合成摘要...")
         logger.info("📝 Reduce 阶段：合成 %d 个段落摘要...", len(mini_summaries))
 
         combined = "\n\n".join(mini_summaries)

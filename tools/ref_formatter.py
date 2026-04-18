@@ -66,7 +66,9 @@ class RefFormatterTool(Tool):
         spec.loader.exec_module(mod)
 
         stages = {'A': True, 'B': False, 'C': False, 'D': False, 'E': False}
+        self.report_progress(10, "开始格式化参考文献...")
         mod.process_document(file_path, modify_in_place=modify_in_place, stages=stages)
+        self.report_progress(90, "参考文献格式化完成")
 
         output_path = _get_output_path(file_path, modify_in_place)
 
