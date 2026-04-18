@@ -159,6 +159,8 @@ class InspectDocFormatTool(Tool):
     """
 
     name = "inspect_document_format"
+    injected_configs = ["format_rules"]
+    required_configs = ["format_rules"]
     description = (
         "检查Word文档的格式和排版属性（样式、字体、缩进、行距、对齐等）。\n"
         "只查格式，不输出内容（节省token）。每段仅显示前20字作为定位标记。\n"

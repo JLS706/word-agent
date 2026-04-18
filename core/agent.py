@@ -545,7 +545,7 @@ class Agent:
 
         # ── Skill Config 注入：将 config 中该工具对应的参数作为默认值注入 ──
         # LLM 显式传递的参数优先级更高，不会被 config 覆盖
-        arguments = self._inject_skill_config(name, arguments)
+        arguments = self._inject_skill_config(tool, arguments)
 
         # 实际执行
         try:
@@ -685,34 +685,20 @@ class Agent:
     # Skill Config → 工具参数注入（Tool-Skill 分离架构）
     # ─────────────────────────────────────────────
 
-    # 工具名 → config 中对应的参数键 映射表
-    # 定义了哪些 config 键应该注入到哪个工具
-    _TOOL_CONFIG_MAP = {
-        "inspect_document_format": ["format_rules"],
-        "format_references": ["ref_format_config"],
-        "analyze_document": ["acronym_whitelist", "pipeline_order"],
-    }
-
-    # 工具名 → 必须由 Skill 提供的 config 参数
-    # 如果这些参数在注入后仍然缺失，工具将拒绝执行并给出友好提示
-    # 这是 Tool-Skill 分离架构的核心：工具 = 能力(HOW)，Skill = 知识(WHAT)
-    _TOOL_REQUIRED_CONFIG = {
-        "inspect_document_format": ["format_rules"],
-    }
-
-    def _inject_skill_config(self, tool_name: str, arguments: dict) -> dict:
+    def _inject_skill_config(self, tool, arguments: dict) -> dict:
         """
         将 Skill Config 中的相关参数注入到工具调用中。
 
-        注入原则（Tool-Skill 分离架构）：
+        注入原则（Tool-Skill 分离架构 + OCP 开闭原则）：
+          - 每个 Tool 通过 injected_configs / required_configs 声明自身依赖
+          - Agent 引擎动态读取声明，无需维护硬编码映射表
           - config 参数作为默认值（优先级低于 LLM 显式传参）
-          - 只注入 _TOOL_CONFIG_MAP 中声明的参数
           - LLM 已经传递的参数不会被覆盖
-          - _TOOL_REQUIRED_CONFIG 中声明的参数如果缺失，记录警告
+          - required_configs 中声明的参数如果缺失，记录警告
             （工具自身会检测缺失并返回友好错误信息）
 
         Args:
-            tool_name: 工具名称
+            tool: 工具实例（从中读取 injected_configs / required_configs）
             arguments: LLM 传递的原始参数
 
         Returns:
@@ -720,28 +706,27 @@ class Agent:
         """
         injected = dict(arguments)  # 浅拷贝，不修改原始参数
 
-        # 注入 Skill config 参数
-        if self._active_config:
-            config_keys = self._TOOL_CONFIG_MAP.get(tool_name)
-            if config_keys:
-                for key in config_keys:
-                    if key not in injected and key in self._active_config:
-                        value = self._active_config[key]
-                        if value is not None:  # null 表示显式跳过
-                            injected[key] = value
-                            if self.verbose:
-                                logger.debug("  ⚙️ Skill Config 注入: %s.%s",
-                                             tool_name, key)
+        # 动态读取工具声明的配置依赖（OCP：新增工具无需修改 Agent）
+        config_keys = getattr(tool, 'injected_configs', [])
+        if self._active_config and config_keys:
+            for key in config_keys:
+                if key not in injected and key in self._active_config:
+                    value = self._active_config[key]
+                    if value is not None:  # null 表示显式跳过
+                        injected[key] = value
+                        if self.verbose:
+                            logger.debug("  ⚙️ Skill Config 注入: %s.%s",
+                                         tool.name, key)
 
         # 检查必要参数是否就位（仅警告，实际拒绝由工具自身完成）
-        required_keys = self._TOOL_REQUIRED_CONFIG.get(tool_name)
+        required_keys = getattr(tool, 'required_configs', [])
         if required_keys:
             missing = [k for k in required_keys if k not in injected]
             if missing:
                 logger.warning(
                     "  ⚠️ 工具 %s 缺少必要的 Skill Config 参数: %s "
                     "— 工具将拒绝执行。请确保用户输入包含触发 Skill 的关键词。",
-                    tool_name, missing
+                    tool.name, missing
                 )
 
         return injected

@@ -12,6 +12,7 @@ from tools.base import Tool
 
 class AnalyzeDocumentTool(Tool):
     name = "analyze_document"
+    injected_configs = ["acronym_whitelist", "pipeline_order"]
     description = (
         "分析Word文档的整体状况，检测其中包含哪些可处理的内容。"
         "返回结构化的分析报告，帮助你制定执行计划。"

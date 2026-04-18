@@ -20,6 +20,13 @@ class Tool(ABC):
     description: str = ""
     parameters: dict = {}  # JSON Schema 格式
 
+    # ── 声明式配置依赖（OCP：子类声明，引擎自动注入）──
+    # 声明该工具需要从 Skill Config 中注入哪些键
+    # Agent 引擎在执行工具前自动将匹配的 config 值注入 arguments
+    injected_configs: list[str] = []
+    # 声明哪些 config 键是必须的（缺失时工具应拒绝执行）
+    required_configs: list[str] = []
+
     # 由异步引擎在执行前注入，工具完成后置 None
     # 工具代码通过 self.report_progress(percent, msg) 调用即可
     _progress_callback: Optional[ProgressCallback] = None

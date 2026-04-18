@@ -26,6 +26,7 @@ def _get_output_path(file_path: str, modify_in_place: bool) -> str:
 
 class RefFormatterTool(Tool):
     name = "format_references"
+    injected_configs = ["ref_format_config"]
     description = (
         "格式化Word文档中的参考文献列表。包括：统一字体字号、"
         "英文标题转Sentence Case、期刊名/会议名自动斜体。\n"

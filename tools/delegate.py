@@ -76,16 +76,19 @@ class DelegateTaskTool(Tool):
         "required": ["role", "objective", "target_file"],
     }
 
-    def __init__(self, llm, tool_registry, workspace: WorkspaceProvider = None):
+    def __init__(self, llm, tool_registry, workspace: WorkspaceProvider = None,
+                 coordinator_agent=None):
         """
         Args:
             llm: 共享的 LLM 实例（子 Agent 复用，不重新创建连接）
             tool_registry: 主 Agent 的完整工具注册表（子 Agent 会从中派生子集）
             workspace: 工作区供应商（默认 LocalFolderWorkspace）
+            coordinator_agent: Coordinator Agent 实例引用（用于透传 _active_config 给 Worker）
         """
         self._llm = llm
         self._master_registry = tool_registry
         self._workspace = workspace or LocalFolderWorkspace()
+        self._coordinator = coordinator_agent
 
     def execute(
         self,
@@ -152,6 +155,17 @@ class DelegateTaskTool(Tool):
                 from core.schema import Message, Role
                 worker.history.clear()
                 worker.history.append(Message(role=Role.SYSTEM, content=system_prompt))
+
+                # ── 关键：透传 Coordinator 的 Skill Config 给 Worker ──
+                # Worker 无 SkillManager，但需要 _active_config 来注入工具参数
+                # （如 format_rules、ref_format_config 等领域知识）
+                if self._coordinator and hasattr(self._coordinator, '_active_config'):
+                    worker._active_config = dict(self._coordinator._active_config)
+                    if worker._active_config:
+                        logger.info(
+                            "[Delegate] ⚙️ Skill Config 透传: %s",
+                            list(worker._active_config.keys()),
+                        )
 
                 # ── 5. Worker 在隔离工作区中执行（异步驱动，心跳中继）──
                 worker_input = (

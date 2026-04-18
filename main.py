@@ -138,7 +138,9 @@ def create_agent(config: dict, dry_run: bool = False):
 
     # 🐝 蜂群派发器：只有 Coordinator（主 Agent）拥有此工具
     # Worker 通过 registry.exclude({"delegate_task"}) 获得无此工具的子集
-    registry.register(DelegateTaskTool(llm, registry))  # 星型协调器核心
+    # coordinator_agent 在 Agent 创建后回填（见下方）
+    delegate_tool = DelegateTaskTool(llm, registry)
+    registry.register(delegate_tool)
 
     # 自动加载已审批的自定义工具
     custom_count = load_custom_tools(registry)
@@ -170,6 +172,9 @@ def create_agent(config: dict, dry_run: bool = False):
         memory=memory,
         skill_manager=skill_manager,
     )
+
+    # 回填 Coordinator 引用：让 DelegateTaskTool 能透传 _active_config 给 Worker
+    delegate_tool._coordinator = agent
 
     return agent
 
