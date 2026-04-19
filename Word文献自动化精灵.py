@@ -711,10 +711,29 @@ def check_acronym_definitions(doc):
     else:
         print("   ✅ 缩写定义检测通过！未发现明显缺失。")
 
-def process_document(input_file, modify_in_place=False, stages=None):
-    """整合所有阶段的运行逻辑，stages 字典控制哪些阶段执行。"""
+def process_document(input_file, modify_in_place=False, stages=None,
+                     word=None, doc=None, progress_callback=None):
+    """
+    整合所有阶段的运行逻辑，stages 字典控制哪些阶段执行。
+
+    Args:
+        input_file: Word 文档路径
+        modify_in_place: 是否覆盖原文件
+        stages: 阶段开关字典 {'A': bool, 'B': bool, ...}
+        word: 外部传入的 Word.Application COM 对象（Agent 模式由 COMSafeLock 提供）。
+              为 None 时走独立 GUI 模式的旧逻辑（自行 Dispatch）。
+        doc: 外部传入的已打开 Document COM 对象。与 word 配对使用。
+        progress_callback: 心跳回调函数 callback(percent: int, message: str)。
+              Agent 模式下由 Tool 的 report_progress 桥接，用于向看门狗续命。
+              为 None 时静默跳过（兼容独立 GUI 模式）。
+    """
     if stages is None:
         stages = {'A': True, 'B': True, 'C': True, 'D': False}
+
+    # 心跳辅助函数：安全调用回调（None 时静默跳过）
+    def _hb(pct, msg=""):
+        if progress_callback:
+            progress_callback(pct, msg)
 
     abs_input = os.path.abspath(input_file)
     if not os.path.exists(abs_input):
@@ -724,6 +743,11 @@ def process_document(input_file, modify_in_place=False, stages=None):
     base, ext = os.path.splitext(abs_input)
     file_format = _get_word_file_format(ext)
 
+    # ── COM 接管分支 ──
+    # external_com=True: Agent 模式，word/doc 由 COMSafeLock 提供，本函数不管进程生命周期
+    # external_com=False: 独立 GUI 模式，本函数自行 Dispatch/Open/Close/Save
+    external_com = (word is not None and doc is not None)
+
     if modify_in_place:
         output_file = abs_input
         print(f"🚀 启动自动化引擎，处理文件并【直接覆盖原文档】: {os.path.basename(abs_input)}")
@@ -731,26 +755,29 @@ def process_document(input_file, modify_in_place=False, stages=None):
         output_file = os.path.abspath(f"{base}_processed{ext}")
         print(f"🚀 启动自动化引擎，处理文件并【另存副本】: {os.path.basename(abs_input)}")
 
-    word = None
-    doc = None
     was_already_open = False
 
     try:
-        word = win32com.client.Dispatch("Word.Application")
-        word.Visible = True
-        
+        if not external_com:
+            # 独立 GUI 模式：自行拉起 Word 进程
+            word = win32com.client.Dispatch("Word.Application")
+            word.Visible = True
+
         # 强制关闭域代码显示，否则 Find.Execute 可能无法跨域匹配文本
         try:
             word.ActiveWindow.View.ShowFieldCodes = False
         except Exception:
             pass
 
-        existing_doc = _is_document_open(word, abs_input)
-        if existing_doc:
-            doc = existing_doc
-            was_already_open = True
-        else:
-            doc = word.Documents.Open(abs_input)
+        if not external_com:
+            existing_doc = _is_document_open(word, abs_input)
+            if existing_doc:
+                doc = existing_doc
+                was_already_open = True
+            else:
+                doc = word.Documents.Open(abs_input)
+
+        _hb(5, "文档已打开，开始处理...")
 
         # =============================================================
         # 阶段 A：参考文献格式排版与修正
@@ -768,6 +795,8 @@ def process_document(input_file, modify_in_place=False, stages=None):
                 para = doc.Paragraphs(i)
                 text = _get_paragraph_text_safe(para)
                 all_paras_cache.append((i, para, text))
+                if i % 20 == 0:
+                    _hb(5 + int(5 * i / total_paras), f"[A] 扫描段落 {i}/{total_paras}")
 
                 if not in_references_section:
                     if "参考文献" in text and len(text) < 50:
@@ -799,6 +828,7 @@ def process_document(input_file, modify_in_place=False, stages=None):
                         else:
                             ref_entries.append({'para_indices': [cache_idx], 'full_text': text})
 
+                _hb(12, f"[A] 发现 {len(ref_entries)} 条参考文献，开始格式修复...")
                 count = 0
                 for entry in ref_entries:
                     full_text = entry['full_text']
@@ -809,6 +839,8 @@ def process_document(input_file, modify_in_place=False, stages=None):
                         continue
                         
                     count += 1
+                    if count % 5 == 0:
+                        _hb(12 + int(6 * count / len(ref_entries)), f"[A] 格式修复 {count}/{len(ref_entries)}")
                     for cache_idx in entry['para_indices']:
                         _, para, _ = all_paras_cache[cache_idx]
                         try:
@@ -876,6 +908,8 @@ def process_document(input_file, modify_in_place=False, stages=None):
             figure_entries = []
             total_paras_d = doc.Paragraphs.Count
             for i in range(1, total_paras_d + 1):
+                if i % 20 == 0:
+                    _hb(20 + int(5 * i / total_paras_d), f"[D] 扫描图注 {i}/{total_paras_d}")
                 para = doc.Paragraphs(i)
                 text = _get_paragraph_text_safe(para)
                 fig_match = FIG_HANDWRITTEN_PATTERN.match(text)
@@ -937,7 +971,10 @@ def process_document(input_file, modify_in_place=False, stages=None):
 
                 # ── 步骤3：按文档顺序逐条转换（保证 SEQ 编号正确）──
                 converted = 0
-                for fig in figure_entries:
+                for fig_idx, fig in enumerate(figure_entries):
+                    if fig_idx % 3 == 0:
+                        _hb(26 + int(8 * fig_idx / len(figure_entries)),
+                            f"[D] 转换题注 {fig_idx+1}/{len(figure_entries)}")
                     try:
                         para = doc.Paragraphs(fig['para_index'])
                         rng = para.Range
@@ -1052,6 +1089,7 @@ def process_document(input_file, modify_in_place=False, stages=None):
             print("\n⏭️ [阶段B] 已跳过（用户未勾选）")
         else:
             print("\n🔗 [阶段B] 正在执行动态交叉引用生成...")
+            _hb(35, "[B] 开始文献交叉引用生成...")
 
             # ── 第1步：预扫描参考文献列表，计算所有有效的哈希书签名 ──
             # 在动任何域代码之前，先确定哪些 ARef_{hash} 是当前有效的。
@@ -1088,6 +1126,7 @@ def process_document(input_file, modify_in_place=False, stages=None):
                             ref_para_data.append((para, text, num, bkmk_name))
 
                 print(f"   📋 预扫描完毕：当前参考文献 {len(valid_hashes)} 条")
+                _hb(38, f"[B] 预扫描完毕，{len(valid_hashes)} 条文献，开始清理旧域代码...")
 
                 # ── 第2步：智能清理旧域代码 ──
                 # 核心策略：
@@ -1100,7 +1139,10 @@ def process_document(input_file, modify_in_place=False, stages=None):
                 orphan_count = 0
                 kept_count = 0
                 try:
-                    for fi in range(doc.Fields.Count, 0, -1):
+                    total_fields_b2 = doc.Fields.Count
+                    for fi in range(total_fields_b2, 0, -1):
+                        if fi % 20 == 0:
+                            _hb(39, f"[B] 清理域代码 {total_fields_b2 - fi}/{total_fields_b2}")
                         try:
                             fld = doc.Fields(fi)
                             code_text = fld.Code.Text
@@ -1254,6 +1296,7 @@ def process_document(input_file, modify_in_place=False, stages=None):
                             return True
 
                     # ====== 新增：提取并处理复合交叉引用（如 [13-15], [1, 2]） ======
+                    _hb(45, "[B] 扫描复合引用...")
                     compound_targets = set()
                     for para in doc.Paragraphs:
                         text = para.Range.Text
@@ -1265,7 +1308,10 @@ def process_document(input_file, modify_in_place=False, stages=None):
                     if compound_targets:
                         print(f"   🔍 发现并处理 {len(compound_targets)} 种组合引用，如 {list(compound_targets)[:3]}...")
                         # 按照长度从长到短排序，避免短的字符串包含在长的字符串内部
-                        for comp_target in sorted(compound_targets, key=len, reverse=True):
+                        sorted_compounds = sorted(compound_targets, key=len, reverse=True)
+                        for comp_idx, comp_target in enumerate(sorted_compounds):
+                            _hb(48 + int(7 * comp_idx / max(len(sorted_compounds), 1)),
+                                f"[B] 复合引用替换 {comp_idx+1}/{len(sorted_compounds)}")
                             word.Selection.HomeKey(Unit=6)
                             find = word.Selection.Find
                             find.ClearFormatting()
@@ -1363,7 +1409,10 @@ def process_document(input_file, modify_in_place=False, stages=None):
 
                     # ====== 处理单一引用 [X] ======
                     sorted_targets = sorted(bookmark_map.keys(), key=len, reverse=True)
-                    for target_text in sorted_targets:
+                    for tgt_idx, target_text in enumerate(sorted_targets):
+                        if tgt_idx % 3 == 0:
+                            _hb(56 + int(10 * tgt_idx / max(len(sorted_targets), 1)),
+                                f"[B] 单一引用替换 {tgt_idx+1}/{len(sorted_targets)}")
                         bkmk_name, field_switch = bookmark_map[target_text]
                         word.Selection.HomeKey(Unit=6)
                         find = word.Selection.Find
@@ -1539,6 +1588,7 @@ def process_document(input_file, modify_in_place=False, stages=None):
             print("\n⏭️ [阶段C] 已跳过（用户未勾选）")
         else:
             print("\n🖼️ [阶段C] 正在执行图注(Figure)动态交叉引用生成...")
+            _hb(70, "[C] 开始图注交叉引用生成...")
 
             # ── 预处理：清理上一次运行残留的图注 REF 域和书签 ──
             print("   🧹 正在清理旧的图注交叉引用域代码...")
@@ -1575,6 +1625,7 @@ def process_document(input_file, modify_in_place=False, stages=None):
                 print("   ℹ️  未发现旧的图注交叉引用，无需清理")
 
             fig_bookmark_map = {}
+            _hb(72, "[C] 扫描图注段落...")
 
             for para in doc.Paragraphs:
                 # 严密防线：只收集真正被打上“题注”标签的段落，防止误杀正文独立成段的引用（比如“图2.4是一个重要的...”）
@@ -1682,7 +1733,10 @@ def process_document(input_file, modify_in_place=False, stages=None):
                 all_caption_bkmk_names = list(fig_bookmark_map.values())
 
                 sorted_fig_targets = sorted(fig_bookmark_map.keys(), key=len, reverse=True)
-                for core_num in sorted_fig_targets:
+                for fig_tgt_idx, core_num in enumerate(sorted_fig_targets):
+                    if fig_tgt_idx % 2 == 0:
+                        _hb(78 + int(12 * fig_tgt_idx / max(len(sorted_fig_targets), 1)),
+                            f"[C] 图注替换 {fig_tgt_idx+1}/{len(sorted_fig_targets)}")
                     bkmk_name = fig_bookmark_map[core_num]
                     word.Selection.HomeKey(Unit=6)
                     find = word.Selection.Find
@@ -1847,27 +1901,39 @@ def process_document(input_file, modify_in_place=False, stages=None):
         if not stages.get('E', True):
             print("\n⏭️ [阶段E] 已跳过（用户未勾选）")
         else:
+            _hb(92, "[E] 开始缩写定义检测...")
             check_acronym_definitions(doc)
+            _hb(96, "[E] 缩写检测完成")
 
         # =============================================================
         # 保存（仅当执行了修改文档的阶段时才保存）
         # =============================================================
-        modifying_stages = any(stages.get(s) for s in ['A', 'B', 'C', 'D'])
-        if modifying_stages:
-            doc.SaveAs2(output_file, FileFormat=file_format)
-            print(f"\n🎉 处理完成！已保存为: {os.path.basename(output_file)}")
+        if not external_com:
+            # 独立 GUI 模式：自行保存
+            modifying_stages = any(stages.get(s) for s in ['A', 'B', 'C', 'D'])
+            if modifying_stages:
+                doc.SaveAs2(output_file, FileFormat=file_format)
+                print(f"\n🎉 处理完成！已保存为: {os.path.basename(output_file)}")
+            else:
+                print(f"\n🎉 检查完成！（本次仅执行检测，未修改文档，无需保存）")
         else:
-            print(f"\n🎉 检查完成！（本次仅执行检测，未修改文档，无需保存）")
+            # Agent 模式：保存由 COMSafeLock.__exit__ 处理
+            print(f"\n🎉 处理完成！（Agent 模式，保存由安全锁管理）")
+
+        _hb(98, "处理完成")
 
     except Exception as e:
         print(f"❌ 剧本执行崩溃: {e}")
         traceback.print_exc()
     finally:
-        try:
-            if doc is not None and not was_already_open:
-                doc.Close(SaveChanges=0)
-        except Exception:
-            pass
+        if not external_com:
+            # 独立 GUI 模式：自行关闭文档
+            try:
+                if doc is not None and not was_already_open:
+                    doc.Close(SaveChanges=0)
+            except Exception:
+                pass
+        # Agent 模式：doc/word 生命周期由 COMSafeLock 管理，此处不触碰
 
 
 class RedirectLogger:

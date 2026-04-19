@@ -59,17 +59,20 @@ class COMSafeLock(ContextDecorator):
         """返回所有活跃 COMSafeLock 正在监控的 Word PID 集合的副本。"""
         return set(cls._active_target_pids)
 
-    def __init__(self, doc_path: str, stall_timeout: float = 5.0):
+    def __init__(self, doc_path: str, stall_timeout: float = 5.0,
+                 read_only: bool = False):
         """
         Args:
             doc_path: Word 文档路径
             stall_timeout: 心跳停滞超时（秒）。
                 连续 stall_timeout 秒没有收到 heartbeat() 调用则视为假死。
                 默认 5.0秒 —— 对 COM 弹窗死锁的发现速度是原来 30秒的 6倍。
+            read_only: 只读模式。为 True 时退出不保存文档（用于只读检测工具）。
         """
         self.doc_path = os.path.abspath(doc_path)
         self.backup_path = self.doc_path + ".safebak"
         self.stall_timeout = stall_timeout
+        self.read_only = read_only
 
         self.word_app = None
         self.doc = None
@@ -211,7 +214,7 @@ class COMSafeLock(ContextDecorator):
         # ── 4. 打开文档 ──
         self.doc = self.word_app.Documents.Open(self.doc_path)
         self.heartbeat()  # 文档打开成功 = 第一次心跳
-        return self.doc
+        return self.word_app, self.doc
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """
@@ -222,10 +225,11 @@ class COMSafeLock(ContextDecorator):
         """
         try:
             if not self.is_timeout and exc_type is None:
-                # 正常完成 → 保存
-                if self.doc:
+                # 正常完成 → 保存（只读模式跳过）
+                if self.doc and not self.read_only:
                     self.doc.Save()
-                logger.debug("[COMSafeLock] ✅ 操作完成，修改已保存")
+                logger.debug("[COMSafeLock] ✅ 操作完成%s",
+                             "（只读，未保存）" if self.read_only else "，修改已保存")
             else:
                 logger.warning(
                     "[COMSafeLock] ⚠️ 异常或超时，放弃保存 (exc=%s)",

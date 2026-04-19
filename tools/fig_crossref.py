@@ -43,6 +43,12 @@ class FigCrossRefTool(Tool):
     }
 
     def execute(self, file_path: str, modify_in_place: bool = True) -> str:
+        from core.com_watchdog import COMSafeLock
+
+        abs_path = os.path.abspath(file_path)
+        if not os.path.exists(abs_path):
+            return f"❌ 文件不存在: {abs_path}"
+
         agent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         sys.path.insert(0, agent_dir)
 
@@ -56,9 +62,19 @@ class FigCrossRefTool(Tool):
 
         # D+C 一起执行：D 生成 draft_fig_map，C 使用它来映射草稿编号
         stages = {'A': False, 'B': False, 'C': True, 'D': True, 'E': False}
-        self.report_progress(10, "开始处理图注交叉引用...")
-        mod.process_document(file_path, modify_in_place=modify_in_place, stages=stages)
-        self.report_progress(90, "图注交叉引用生成完成")
+        self.report_progress(5, "开始处理图注交叉引用...")
+
+        with COMSafeLock(abs_path) as (word_app, doc_obj):
+            mod.process_document(
+                abs_path,
+                modify_in_place=modify_in_place,
+                stages=stages,
+                word=word_app,
+                doc=doc_obj,
+                progress_callback=lambda pct, msg: self.report_progress(pct, msg),
+            )
+
+        self.report_progress(95, "图注交叉引用生成完成")
 
         output_path = _get_output_path(file_path, modify_in_place)
         return (

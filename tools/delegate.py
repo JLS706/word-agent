@@ -181,40 +181,60 @@ class DelegateTaskTool(Tool):
                 import asyncio as _asyncio
 
                 async def _drive_worker():
-                    """驱动 Worker 并中继心跳事件。"""
+                    """
+                    驱动 Worker 并中继心跳事件。
+
+                    防御加固：顶层 try/except 捕获所有内层异常
+                    （含 Worker 看门狗触发的 CancelledError / COM 异常），
+                    防止异常击穿嵌套事件循环导致 Coordinator 静默崩溃。
+                    """
                     final_text_parts = []
                     # 让 Coordinator 看门狗立刻知道 Worker 已启动
                     self.report_progress(5, f"[Worker:{role}] 启动")
-                    async for ev in worker.run_async(worker_input):
-                        if ev.type == "tool_progress":
-                            # Worker 子工具的心跳 → 冒泡给 Coordinator
-                            pct = ev.metadata.get("percent", 50)
-                            tool_name = ev.metadata.get("tool", "?")
-                            # 钳位到 [5, 95]，避免干扰 Coordinator 自己的 0/100
-                            relay_pct = max(5, min(95, pct))
-                            self.report_progress(
-                                relay_pct,
-                                f"[Worker:{role}:{tool_name}] {ev.content}",
-                            )
-                        elif ev.type == "tool_start":
-                            self.report_progress(
-                                10, f"[Worker:{role}] {ev.content}"
-                            )
-                        elif ev.type == "tool_end":
-                            self.report_progress(
-                                80, f"[Worker:{role}] {ev.content}"
-                            )
-                        elif ev.type == "tool_timeout":
-                            stall = ev.metadata.get("stall_seconds", "?")
-                            self.report_progress(
-                                85,
-                                f"[Worker:{role}] 子工具熔断({stall}s): {ev.content}",
-                            )
-                        elif ev.type == "text":
-                            final_text_parts.append(ev.content)
-                        elif ev.type == "error":
-                            logger.warning("[Delegate] Worker 错误事件: %s", ev.content)
-                        # finish 事件不转发
+                    try:
+                        async for ev in worker.run_async(worker_input):
+                            if ev.type == "tool_progress":
+                                # Worker 子工具的心跳 → 冒泡给 Coordinator
+                                pct = ev.metadata.get("percent", 50)
+                                tool_name = ev.metadata.get("tool", "?")
+                                # 钳位到 [5, 95]，避免干扰 Coordinator 自己的 0/100
+                                relay_pct = max(5, min(95, pct))
+                                self.report_progress(
+                                    relay_pct,
+                                    f"[Worker:{role}:{tool_name}] {ev.content}",
+                                )
+                            elif ev.type == "tool_start":
+                                self.report_progress(
+                                    10, f"[Worker:{role}] {ev.content}"
+                                )
+                            elif ev.type == "tool_end":
+                                self.report_progress(
+                                    80, f"[Worker:{role}] {ev.content}"
+                                )
+                            elif ev.type == "tool_timeout":
+                                stall = ev.metadata.get("stall_seconds", "?")
+                                self.report_progress(
+                                    85,
+                                    f"[Worker:{role}] 子工具熔断({stall}s): {ev.content}",
+                                )
+                            elif ev.type == "text":
+                                final_text_parts.append(ev.content)
+                            elif ev.type == "error":
+                                logger.warning("[Delegate] Worker 错误事件: %s", ev.content)
+                            # finish 事件不转发
+                    except _asyncio.CancelledError:
+                        logger.warning("[Delegate] Worker 内层事件循环被取消")
+                        final_text_parts.append(
+                            "\n[Worker 被取消（内层看门狗或外层 Coordinator 触发）]"
+                        )
+                    except Exception as inner_exc:
+                        logger.error(
+                            "[Delegate] Worker 内层异常: %s\n%s",
+                            inner_exc, traceback.format_exc(),
+                        )
+                        final_text_parts.append(
+                            f"\n[Worker 内层异常: {inner_exc}]"
+                        )
                     return "".join(final_text_parts)
 
                 raw_result = _asyncio.run(_drive_worker())
