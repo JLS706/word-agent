@@ -2,7 +2,7 @@
 
 **学术论文排版 AI 智能助手** —— 通过自然语言指令驱动 Word 文档自动化处理。
 
-基于 **ReAct (Reasoning + Acting)** 架构，参考 [OpenManus](https://github.com/FoundationAgents/OpenManus) 和 [smolagents](https://github.com/huggingface/smolagents) 设计理念打造的轻量级 AI Agent 项目。
+基于 **ReAct (Reasoning + Acting) + Coordinator-Worker Swarm** 架构，从零手写的轻量级 AI Agent 框架。无 LangChain 依赖，仅 openai + python-docx + pywin32。
 
 ## ✨ 功能
 
@@ -27,6 +27,18 @@
 | `summarize_document` | Map-Reduce 全文摘要（分块摘要 → 合成总结，覆盖全文） |
 | `index_document` + `search_document` | RAG 向量检索（文档索引 → 语义搜索） |
 
+### RAG 文献库
+
+| 工具 | 功能描述 |
+|------|---------|
+| `index_literature` | 单篇文献索引（PDF/Word → 语义切块 → 向量化） |
+| `search_literature` | 文献语义搜索（单篇精查 / 跨库泛搜） |
+| `list_literature` | 列出已索引文献清单 |
+| `auto_bind_literature` | 自动绑定参考文献编号 → 本地文件路径 |
+| `verify_citations` | 引用溯源审计（批量忠实度校验） |
+| `check_claim` | 单句级事实核查（Claim → Source 比对） |
+| `analyze_figure` | 🖼️ PDF 图表视觉分析（多模态 LLM 驱动） |
+
 ### 高级能力
 
 | 能力 | 描述 |
@@ -35,15 +47,15 @@
 | `create_tool` / `approve_tool` | 🧬 Agent 自主创造新工具（编写 → 沙盒测试 → 审批注册） |
 | `save/forget/list_learned_rules` | Agent 自学习系统（将经验存为规则，持续改进） |
 | 三级分层记忆 | L1 核心规则 / L2 长期反思 / L3 短期对话，含召回率淘汰 + L2 融合节点 |
-| Multi-Agent 流水线 | Planner → Executor → Reviewer 三角色协作 |
-| 子任务反思 Hook | 子任务完成后自动提炼经验存入 L2 长期记忆 |
+| Coordinator-Worker Swarm | 蜂群派发：Coordinator 动态 Fork Worker（Planner/Executor/Reviewer/Writer），Worker 自杀销毁 |
+| `delegate_task` | 结构化任务委派（隔离工作区 + JSON 报告 + commit/rollback） |
 | Token 水位压缩 | 基于 Token 估算的两级上下文压缩（规则截取 / LLM 摘要） |
 | Prompt Cache 优化 | 静态根 + 动态叶分离架构，自动命中厂商 KV Cache（降价 50%~90%） |
 | Skill 插件系统 | 按需加载技能手册（关键词 + Embedding 双层匹配） |
 | 多 Key 自动轮换 | API Key 失效时自动切换到下一个可用 Key |
 | 结构化错误恢复 | 三级错误分类 + 自动重试 + 引导 LLM 自修正 |
-| 回溯修正 (Backtracking) | 逐步执行 → 每步验证 → 失败时自动回溯 |
-| Checkpoint 断点续传 | 流水线中途中断后可从断点恢复 |
+| 心跳看门狗 (COMSafeLock) | 信号驱动事件泵 + PID 差集精准击杀僵尸 Word 进程 |
+| 工作区隔离 (Workspace) | Copy-on-Write 深拷贝 + commit/rollback 事务语义 + 路径逃逸防御 |
 
 ## 🚀 快速开始
 
@@ -102,7 +114,7 @@ python main.py
 - `生成文献交叉引用`
 - `检查一下缩写有没有定义`
 - `总结一下这篇论文的主要内容`
-- `pipeline C:\path\to\论文.docx`（Multi-Agent 全流程）
+- `帮我全面排版这篇论文`（Coordinator 自动拆解为多个 Worker 子任务）
 
 ## 🏗️ 项目架构
 
@@ -112,23 +124,24 @@ agent/
 │   ├── config.example.toml     # 配置模板（多方案示例）
 │   └── config.toml             # 实际配置（.gitignore）
 ├── core/
-│   ├── schema.py               # 数据模型（Message, ToolCall, AgentState）
-│   ├── llm.py                  # LLM 接口封装（多 Key 自动轮换）
-│   ├── agent.py                # ReAct Agent 核心（Token 水位压缩 + 结构化错误恢复）
-│   ├── prompt.py               # System Prompt 模板（静态根 + 动态叶，Prompt Cache 友好）
+│   ├── schema.py               # 数据模型（Message, ToolCall, StreamEvent, AgentState）
+│   ├── llm.py                  # LLM 接口封装（多 Key 自动轮换 + 流式 chat_stream）
+│   ├── agent.py                # ReAct 引擎（run_async 流式状态机 + Token 压缩 + 心跳事件泵）
+│   ├── prompt.py               # Prompt 工厂（Coordinator/Worker 角色 Prompt + Prompt Cache 分离）
 │   ├── memory.py               # 三级分层记忆（L1核心/L2长期/L3短期 + 融合节点）
 │   ├── embeddings.py           # Embedding + 向量存储（纯 numpy 实现）
-│   ├── multi_agent.py          # Multi-Agent 流水线（回溯修正 + 反思 Hook）
 │   ├── skills.py               # Skill 插件管理器（关键词 + Embedding 双层匹配）
-│   ├── sandbox.py              # 安全沙盒（三层防护 + Docker 隔离）
-│   ├── checkpoint.py           # 断点续传状态管理
-│   └── com_watchdog.py         # Word COM 进程隔离守护
+│   ├── sandbox.py              # 安全沙盒（AST + builtins + 进程隔离 + Docker）
+│   └── com_watchdog.py         # COM 安全锁（心跳看门狗 + PID 差集法 + 快照回滚）
 ├── tools/
 │   ├── base.py                 # Tool 基类 + ToolRegistry
 │   ├── doc_format_inspector.py # 📐 文档格式检查（样式/字体/缩进/行距诊断）
 │   ├── doc_reader.py           # 文档内容读取
 │   ├── doc_summarizer.py       # Map-Reduce 全文摘要
-│   ├── rag.py                  # RAG 向量检索（索引 + 搜索）
+│   ├── rag.py                  # RAG 文献库（文档/文献索引 + 语义搜索 + 自动绑定）
+│   ├── citation_verifier.py    # 引用溯源审计（批量忠实度 + 单句校验）
+│   ├── figure_analyzer.py      # 多模态图表分析（PDF 图表 → 视觉 LLM）
+│   ├── delegate.py             # 🐝 蜂群派发器（Fork Worker → 隔离执行 → 收割报告）
 │   ├── pipeline.py             # 文档分析（宏观扫描）
 │   ├── ref_formatter.py        # 参考文献格式化
 │   ├── ref_crossref.py         # 文献交叉引用
@@ -141,6 +154,8 @@ agent/
 │   ├── tool_creator.py         # 🧬 动态工具创建引擎
 │   ├── memory_tool.py          # 记忆查询/保存
 │   └── word_cleanup.py         # Word 进程清理
+├── sandbox/
+│   └── workspace.py            # 工作区隔离（Copy-on-Write + commit/rollback）
 ├── skills/                     # Skill 插件目录（.md 格式，热加载）
 │   ├── paper_formatting.md     # 论文排版标准流
 │   ├── doc_summary.md          # 文档摘要技能
@@ -150,8 +165,8 @@ agent/
 │   ├── history.json            # 操作历史（最近50条）
 │   ├── learned_rules.json      # L1 核心规则（永不过期）
 │   └── memory_vectors.json     # L2 + L3 向量记忆（含召回追踪）
-├── sandbox/                    # Docker 沙盒微服务
-└── main.py                     # 入口
+├── docker/                     # Docker 沙盒微服务
+└── main.py                     # 入口（工具注册 + Coordinator/Worker 初始化）
 ```
 
 ## 🧠 工作原理
@@ -194,18 +209,23 @@ Agent: "已完成！" → 保存 Q+A 到 L3 短期记忆
 只要 Message[0] 内容不变，前缀就能命中缓存，获得 50%~90% 降价。
 ```
 
-### Multi-Agent 流水线（含回溯修正 + 反思 Hook）
+### Coordinator-Worker Swarm（蜂群协作）
 
 ```
-Phase 1 — Planner:  分析文档 → 制定执行计划 [Step1, Step2, ..., StepN]
+用户: "帮我全面排版这篇论文"
   ↓
-Phase 2 — Executor (逐步执行 + 回溯):
-  Step 1 → 验证 ✅ → 💡 反思提炼经验 → 存入 L2 → Checkpoint
-  Step 2 → 验证 ✅ → 💡 反思提炼经验 → 存入 L2 → Checkpoint
-  Step 3 → 验证 ❌ → 关键错误? 🚨 汇报人类
-                    → 普通错误? 🔄 重试 → 🧭 重规划 → ⏩ 跳过
-  ↓
-Phase 3 — Reviewer: 读取内容 + 检查格式 → 验证并输出报告（S/A/B/C/D 评分）
+Coordinator（主 Agent，持有 delegate_task）
+  ├── 🔍 delegate_task(role=Planner)  → JSON 报告（执行计划）→ Worker 销毁
+  ├── ⚙️ delegate_task(role=Executor) → 隔离工作区执行 → PASS → commit 回写
+  ├── ⚙️ delegate_task(role=Executor) → 隔离工作区执行 → PASS → commit 回写
+  ├── 📝 delegate_task(role=Reviewer) → 独立审查 + L1 宪法校验 → JSON 报告
+  └── 综合各 Worker 报告 → 用清晰中文向用户汇报
+
+关键设计：
+  - Worker 无 delegate_task 工具（防套娃）
+  - Worker 在隔离工作区操作副本（status≠PASS → 丢弃，原文件毫发无伤）
+  - Worker 自杀销毁后，几千 Token 垃圾日志随之消亡
+  - Coordinator 只收到一条清爽的 JSON 报告
 ```
 
 ### 三级分层记忆 (Hierarchical Memory)
@@ -241,11 +261,11 @@ Phase 3 — Reviewer: 读取内容 + 检查格式 → 验证并输出报告（S/
 ### Token 水位线压缩 (Context Overflow Hook)
 
 ```
-估算 Token ─── < 4000 ───→ 不压缩
+估算 Token ─── < 6000 ───→ 不压缩
     │
-    ├── 4000~6000 ──→ Tier 1: 纯规则截取（零 LLM 成本）
+    ├── 6000~8000 ──→ Tier 1: 纯规则截取（零 LLM 成本）
     │
-    └── ≥ 6000 ────→ Tier 2: LLM 智能摘要（~600 Token 成本）
+    └── ≥ 8000 ────→ Tier 2: LLM 智能摘要（~600 Token 成本）
 ```
 
 ### 格式感知架构（查格式 vs 查内容，职责分离）
