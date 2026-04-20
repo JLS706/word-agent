@@ -12,11 +12,8 @@
 
 **Q1. 架构对比：请解释你设计的多Agent架构，它与单Agent的ReAct模式有什么区别？**
 
-<<<<<<< HEAD
-**A (降维打击)**：
-=======
 **回答**：
->>>>>>> 396a04e1d4816757837ac7f1ae5c62beba0538b3
+
 ReAct（Think-Act-Observe）是线性的单体模型，适合简单任务。但在长文本处理中，单体Agent会面临严重的**“上下文污染”**和**“注意力涣散”**。
 我的架构实现了 **Coordinator-Worker 隔离模型**：
 * **职责与物理隔离**：主Agent（Coordinator）剥夺了直接操作文件的权力。它通过 `delegate_task` 动态 Fork 出无状态的 Worker（Executor/Reviewer）在隔离的沙盒工作区执行。
