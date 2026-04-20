@@ -139,6 +139,15 @@ class Agent:
         self._retry_counts = {}
         self._active_config = {}
 
+        try:
+            return self._run_impl(user_input)
+        finally:
+            # 👑 确定性清理：无论正常/异常/超步数退出，都兜底关闭 Word 进程
+            # （带线程超时保护，防止 close_word 卡死级联冻住主流程）
+            self._close_word_safely()
+
+    def _run_impl(self, user_input: str) -> str:
+        """run() 的实际业务逻辑（被 try/finally 包裹以保证 Word 兜底关闭）。"""
         # ── 向量记忆召回（RAG 式）──
         recalled = ""
         if self.memory:
@@ -256,7 +265,7 @@ class Agent:
         """
         total = 0
         for msg in self.history:
-            text = msg.content or ""
+            text = msg.text_content
             total += len(text) // 2
             if msg.tool_calls:
                 for tc in msg.tool_calls:
@@ -293,7 +302,7 @@ class Agent:
             tool_summaries = []
             for msg in middle:
                 if msg.role == Role.TOOL:
-                    first_line = (msg.content or "").split("\n")[0][:80]
+                    first_line = msg.text_content.split("\n")[0][:80]
                     tool_name = msg.name or "unknown"
                     tool_summaries.append(f"{tool_name}: {first_line}")
 
@@ -305,7 +314,7 @@ class Agent:
         else:
             # ── Tier 2: LLM 深度压缩 ──
             middle_text = "\n".join(
-                f"[{msg.role.value}] {(msg.content or '')[:200]}"
+                f"[{msg.role.value}] {msg.text_content[:200]}"
                 for msg in middle
             )
             try:
@@ -636,36 +645,95 @@ class Agent:
         for rule in rules:
             rule_text = rule["rule"].lower()
 
-            # ── 模式匹配："Word进程" + "关闭" → 检查 close_word ──
-            if ("word" in rule_text and ("关闭" in rule_text or "close" in rule_text)):
-                word_used = used_tools & WORD_TOOLS
-                if word_used and "close_word" not in used_tools:
-                    # 自动修正：调用 close_word
-                    tool = self.tools.get("close_word")
-                    if tool:
-                        try:
-                            tool.execute()
-                            self._session_tools.append("close_word")
-                            violations.append(
-                                f"⚠️ [L1 后校验] 检测到使用了 Word 工具 "
-                                f"({', '.join(word_used)}) 但未关闭 Word 进程。"
-                                f"已自动执行 close_word。"
-                            )
-                            if self.verbose:
-                                logger.warning(
-                                    "  🛡️ L1 后校验：自动关闭 Word 进程"
-                                )
-                        except Exception as e:
-                            violations.append(
-                                f"⚠️ [L1 后校验] 检测到违规：使用了 Word 工具但未关闭。"
-                                f"自动修正失败: {e}"
-                            )
+            # ── 注意：Word 进程关闭已迁移到 run()/run_async() 的 finally 块，
+            #   作为确定性流程处理（带超时保护，不依赖 learned_rules 记忆）。
+            #   此处仅保留其他可扩展规则模式的位置。
 
             # ── 未来可扩展更多规则模式 ──
-            # elif "其他关键词" in rule_text:
+            # if "其他关键词" in rule_text:
             #     ...
+            _ = rule_text  # 占位避免 lint 警告
 
         return "\n".join(violations)
+
+    # ─────────────────────────────────────────────
+    # 确定性清理：Word 进程兜底关闭（带超时保护）
+    # ─────────────────────────────────────────────
+
+    def _needs_close_word(self) -> bool:
+        """是否需要兜底关闭 Word 进程。"""
+        used = set(self._session_tools)
+        return bool(used & WORD_TOOLS) and "close_word" not in used
+
+    def _close_word_safely(self, timeout: float = 5.0) -> None:
+        """
+        同步路径的 Word 兜底关闭（用独立线程 + join 超时，防止级联卡死）。
+
+        为什么不直接 tool.execute()：
+          - 若 Word 被隐藏对话框卡住，close_word 可能阻塞数十秒，
+            整个同步主流程（包括调用方 UI）会一起冻住。
+          - 用 daemon 线程 + timeout 做硬隔离：超时后放弃等待，
+            线程随进程退出，确保主流程及时返回。
+        """
+        if not self._needs_close_word():
+            return
+        tool = self.tools.get("close_word")
+        if not tool:
+            return
+
+        import threading
+        done = threading.Event()
+        err: list = []
+
+        def _worker():
+            try:
+                tool.execute()
+            except Exception as e:
+                err.append(e)
+            finally:
+                done.set()
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        if done.wait(timeout):
+            if err:
+                logger.warning("  ⚠️ [finally] close_word 执行失败: %s", err[0])
+            else:
+                self._session_tools.append("close_word")
+                if self.verbose:
+                    logger.info("  🧹 [finally] 已自动关闭 Word 进程")
+        else:
+            logger.warning(
+                "  ⏰ [finally] close_word 超过 %.1fs 未响应，放弃等待（daemon 线程随进程退出）",
+                timeout,
+            )
+
+    async def _close_word_safely_async(self, timeout: float = 5.0) -> None:
+        """
+        异步路径的 Word 兜底关闭（to_thread + wait_for 硬超时）。
+
+        架构纯洁性要求：同步 COM 接口绝不在主线程直接调用。
+        用 asyncio.to_thread 把 close_word 丢进线程池，wait_for 在主事件循环
+        做超时守护——即使 close_word 因 Word 卡死僵死，也不会冻结 LLM 流式输出、
+        WebSocket 推送等其他协程。
+        """
+        if not self._needs_close_word():
+            return
+        tool = self.tools.get("close_word")
+        if not tool:
+            return
+        try:
+            await asyncio.wait_for(asyncio.to_thread(tool.execute), timeout=timeout)
+            self._session_tools.append("close_word")
+            if self.verbose:
+                logger.info("  🧹 [finally] 已自动关闭 Word 进程")
+        except asyncio.TimeoutError:
+            logger.warning(
+                "  ⏰ [finally] close_word 超过 %.1fs 未响应，放弃等待（不阻塞事件循环）",
+                timeout,
+            )
+        except Exception as e:
+            logger.warning("  ⚠️ [finally] close_word 执行失败: %s", e)
 
     def _save_session(self, user_input: str = "", summary: str = ""):
         """将本轮操作记录保存到记忆（含向量存储）"""
@@ -764,6 +832,17 @@ class Agent:
         self._retry_counts = {}
         self._active_config = {}
 
+        try:
+            async for event in self._run_async_impl(user_input):
+                yield event
+        finally:
+            # 👑 确定性清理：无论正常结束/调用方 break(GeneratorExit)/异常，
+            # 都在主事件循环外的线程池里兜底关闭 Word（wait_for 硬超时守护，
+            # 绝不阻塞 LLM 流式输出 / WebSocket 推送 / 其他协程）。
+            await self._close_word_safely_async()
+
+    async def _run_async_impl(self, user_input: str) -> AsyncGenerator[StreamEvent, None]:
+        """run_async() 的实际业务逻辑（被 try/finally 包裹以保证 Word 兜底关闭）。"""
         # ── 向量记忆召回 ──
         recalled = ""
         if self.memory:
@@ -877,11 +956,11 @@ class Agent:
                 wake_event = asyncio.Event()  # 工具线程有新数据时唤醒事件泵
                 loop = asyncio.get_running_loop()
 
-                # 注入进度回调：put 数据后跨线程 set event 唤醒泵
+                # 注入进度回调：支持 metadata 透传（含 temp_timeout 租约申请）
                 tool_obj = self.tools.get(tc.name)
                 if tool_obj is not None:
-                    def _progress_cb(pct, msg, _q=progress_queue, _ev=wake_event, _loop=loop):
-                        _q.put_nowait((pct, msg))
+                    def _progress_cb(pct, msg, metadata=None, _q=progress_queue, _ev=wake_event, _loop=loop):
+                        _q.put_nowait((pct, msg, metadata or {}))
                         _loop.call_soon_threadsafe(_ev.set)
                     tool_obj._progress_callback = _progress_cb
 
@@ -893,71 +972,88 @@ class Agent:
                 task.add_done_callback(lambda _: wake_event.set())
 
                 # ── 信号驱动事件泵（非 busy-polling） ──
-                STALL_TIMEOUT = 5.0  # 心跳停滞阈值（秒）
+                STALL_TIMEOUT = 5.0  # 基础心跳停滞阈值（秒）
                 last_heartbeat = time.time()
                 stall_killed = False
 
-                while not task.done():
-                    # 挂起等待：工具线程 set event 或超时（=心跳截止时间）
-                    remaining = max(0.05, STALL_TIMEOUT - (time.time() - last_heartbeat))
-                    try:
-                        await asyncio.wait_for(wake_event.wait(), timeout=remaining)
-                    except asyncio.TimeoutError:
-                        pass  # 超时 → 下面做心跳检测
-                    wake_event.clear()
-
-                    # 排空队列中所有进度事件 & 刷新心跳
-                    while True:
+                try:
+                    while not task.done():
+                        # 挂起等待：工具线程 set event 或超时（=心跳截止时间）
+                        remaining = max(0.05, STALL_TIMEOUT - (time.time() - last_heartbeat))
                         try:
-                            pct, msg = progress_queue.get_nowait()
-                            last_heartbeat = time.time()  # 心跳续命
-                            yield StreamEvent(
-                                "tool_progress",
-                                msg or f"进度 {pct}%",
-                                metadata={"percent": pct, "tool": tc.name},
+                            await asyncio.wait_for(wake_event.wait(), timeout=remaining)
+                        except asyncio.TimeoutError:
+                            pass  # 超时 → 下面做心跳检测
+                        wake_event.clear()
+
+                        # 排空队列中所有进度事件 & 动态更新看门狗
+                        while True:
+                            try:
+                                pct, msg, meta = progress_queue.get_nowait()
+                                last_heartbeat = time.time()  # 心跳续命
+
+                                # 👑 核心修复：捕获租约申请，动态修改阈值
+                                if "temp_timeout" in meta:
+                                    STALL_TIMEOUT = float(meta["temp_timeout"])
+                                    logger.debug("  ⏰ 看门狗阈值动态调整为: %.1fs", STALL_TIMEOUT)
+
+                                yield StreamEvent(
+                                    "tool_progress",
+                                    msg or f"进度 {pct}%",
+                                    metadata={"percent": pct, "tool": tc.name},
+                                )
+                            except _thread_queue.Empty:
+                                break
+
+                        # ── 心跳停滞检测 ──
+                        stall_sec = time.time() - last_heartbeat
+                        if stall_sec > STALL_TIMEOUT:
+                            # 精准击杀僵尸 Word 进程（从类级别 PID 注册表获取）
+                            from core.com_watchdog import COMSafeLock
+                            active_pids = COMSafeLock.get_active_pids()
+                            killed = COMSafeLock.kill_pids(active_pids) if active_pids else []
+
+                            logger.warning(f"  💀 触发熔断！等待后台线程释放资源...")
+
+                            # 👑 核心修复：不要 cancel，而是设置极短的超时死等线程自己崩溃并执行完 finally
+                            # task.cancel() 只能取消外层 asyncio 包装，杀不掉底层 OS 线程，
+                            # 会导致幽灵线程在未来随机时刻执行快照回滚，覆盖新文件。
+                            # 正确做法：Word 进程已被杀，底层线程会在 1~2 秒内抛出 com_error，
+                            # 给它 3 秒钟时间处理异常并跑完 finally 块的清理逻辑。
+                            try:
+                                await asyncio.wait_for(task, timeout=3.0)
+                            except Exception:
+                                pass
+
+                            # 结构化错误回注历史，唤醒 LLM 大脑
+                            timeout_msg = (
+                                f"❌ 工具 {tc.name} 执行进度卡死超过 {STALL_TIMEOUT:.0f} 秒，"
+                                f"底层进程已强制熔断（击杀 PID: {killed or '未知'}）。\n"
+                                f"可能原因：Word 弹出了隐藏对话框导致 COM 死锁。\n"
+                                f"请尝试：1) 重新调用该工具 2) 换一种参数 3) 跳过此步骤"
                             )
-                        except _thread_queue.Empty:
-                            break
-
-                    # ── 心跳停滞检测 ──
-                    stall_sec = time.time() - last_heartbeat
-                    if stall_sec > STALL_TIMEOUT:
-                        # 精准击杀僵尸 Word 进程（从类级别 PID 注册表获取）
-                        from core.com_watchdog import COMSafeLock
-                        active_pids = COMSafeLock.get_active_pids()
-                        killed = COMSafeLock.kill_pids(active_pids) if active_pids else []
-
-                        # 取消 asyncio task（工具线程会因进程被杀而抛异常）
-                        task.cancel()
-                        try:
-                            await task
-                        except (asyncio.CancelledError, Exception):
-                            pass
-
-                        # 结构化错误回注历史，唤醒 LLM 大脑
-                        timeout_msg = (
-                            f"❌ 工具 {tc.name} 执行进度卡死超过 {STALL_TIMEOUT:.0f} 秒，"
-                            f"底层进程已强制熔断（击杀 PID: {killed or '未知'}）。\n"
-                            f"可能原因：Word 弹出了隐藏对话框导致 COM 死锁。\n"
-                            f"请尝试：1) 重新调用该工具 2) 换一种参数 3) 跳过此步骤"
-                        )
-                        self.history.append(Message(
-                            role=Role.TOOL,
-                            content=timeout_msg,
-                            tool_call_id=tc.id,
-                            name=tc.name,
-                        ))
-                        yield StreamEvent(
-                            "tool_timeout",
-                            timeout_msg,
-                            metadata={
-                                "tool": tc.name,
-                                "stall_seconds": round(stall_sec, 1),
-                                "killed_pids": killed,
-                            },
-                        )
-                        stall_killed = True
-                        break  # 跳出事件泵循环
+                            self.history.append(Message(
+                                role=Role.TOOL,
+                                content=timeout_msg,
+                                tool_call_id=tc.id,
+                                name=tc.name,
+                            ))
+                            yield StreamEvent(
+                                "tool_timeout",
+                                timeout_msg,
+                                metadata={
+                                    "tool": tc.name,
+                                    "stall_seconds": round(stall_sec, 1),
+                                    "killed_pids": killed,
+                                },
+                            )
+                            stall_killed = True
+                            break  # 跳出事件泵循环
+                finally:
+                    # 防御性清理：无论工具怎样退出，强制弹回基础阈值
+                    if STALL_TIMEOUT != 5.0:
+                        logger.debug("  🧹 [防御性清理] 工具退出，看门狗从 %.1fs 弹回 5.0s", STALL_TIMEOUT)
+                        STALL_TIMEOUT = 5.0
 
                 if stall_killed:
                     # 清理回调，继续下一轮 ReAct（LLM 读到错误后决定下一步）
@@ -968,7 +1064,7 @@ class Agent:
                 # 排空工具完成后残留的进度事件
                 while True:
                     try:
-                        pct, msg = progress_queue.get_nowait()
+                        pct, msg, _meta = progress_queue.get_nowait()
                         yield StreamEvent(
                             "tool_progress",
                             msg or f"进度 {pct}%",

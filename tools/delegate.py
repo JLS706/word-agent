@@ -237,7 +237,26 @@ class DelegateTaskTool(Tool):
                         )
                     return "".join(final_text_parts)
 
-                raw_result = _asyncio.run(_drive_worker())
+                # 👑 显式创建新事件循环（不用 asyncio.run）
+                # asyncio.run() 在检测到当前线程已有活跃 loop 时会直接 RuntimeError；
+                # 本方法被 run_async() 通过 asyncio.to_thread() 调度到工作线程中执行，
+                # 该线程通常不应有 loop，但 "通常" 不等于 "必然"——依赖这个隐式不变量
+                # 风险高。显式 new_event_loop + set_event_loop + run_until_complete
+                # 能在本线程安全建立独立 loop，与外层主循环完全隔离。
+                _worker_loop = _asyncio.new_event_loop()
+                try:
+                    _asyncio.set_event_loop(_worker_loop)
+                    raw_result = _worker_loop.run_until_complete(_drive_worker())
+                finally:
+                    try:
+                        # 清理未完成的异步生成器，避免 ResourceWarning
+                        _worker_loop.run_until_complete(
+                            _worker_loop.shutdown_asyncgens()
+                        )
+                    except Exception:
+                        pass
+                    _asyncio.set_event_loop(None)
+                    _worker_loop.close()
                 self.report_progress(95, f"[Worker:{role}] 输出报告中...")
 
                 # ── 6. 提取报告，决定是否回写原文件 ──

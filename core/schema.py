@@ -6,7 +6,7 @@ DocMaster Agent - 数据模型定义
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 @dataclass
 class StreamEvent:
@@ -65,19 +65,68 @@ class ToolResult:
 
 @dataclass
 class Message:
-    """对话消息"""
+    """
+    对话消息。
+
+    content 支持两种格式：
+      - str：纯文本消息（传统模式）
+      - list[dict]：多模态消息（OpenAI Vision 格式）
+        例: [{"type": "text", "text": "..."},
+              {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}]
+    """
     role: Role
-    content: Optional[str] = None
+    content: Optional[Union[str, list[dict]]] = None
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_call_id: Optional[str] = None  # 仅 role=TOOL 时使用
     name: Optional[str] = None          # 仅 role=TOOL 时使用
 
+    @property
+    def text_content(self) -> str:
+        """始终返回纯文本部分（兼容 str 和 list[dict] 两种格式）。"""
+        if self.content is None:
+            return ""
+        if isinstance(self.content, str):
+            return self.content
+        # 多模态格式：拼接所有 text 部分
+        return "".join(
+            part.get("text", "") for part in self.content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+
+    @staticmethod
+    def with_images(
+        role: "Role",
+        text: str,
+        image_data: list[str],
+        detail: str = "auto",
+    ) -> "Message":
+        """
+        创建带图片的多模态消息。
+
+        Args:
+            role: 消息角色
+            text: 文本内容
+            image_data: base64 编码的图片列表（或 URL）
+            detail: 图片解析度 ("auto" / "low" / "high")
+        """
+        parts: list[dict] = [{"type": "text", "text": text}]
+        for img in image_data:
+            if img.startswith(("http://", "https://")):
+                url = img
+            else:
+                url = f"data:image/png;base64,{img}"
+            parts.append({
+                "type": "image_url",
+                "image_url": {"url": url, "detail": detail},
+            })
+        return Message(role=role, content=parts)
+
     def to_dict(self) -> dict:
-        """转为 OpenAI API 兼容的字典格式"""
+        """转为 OpenAI API 兼容的字典格式（自动兼容多模态）"""
         msg = {"role": self.role.value}
 
         if self.content is not None:
-            msg["content"] = self.content
+            msg["content"] = self.content  # str 或 list[dict] 均直接透传
 
         if self.tool_calls:
             msg["tool_calls"] = [

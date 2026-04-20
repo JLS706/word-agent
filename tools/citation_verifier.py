@@ -240,9 +240,9 @@ class VerifyCitationsTool(Tool):
 
     @staticmethod
     def _read_text(file_path: str) -> str:
-        """读取文档纯文本（复用 rag.py 的逻辑）"""
-        from tools.rag import _read_docx_text
-        return _read_docx_text(file_path)
+        """读取文档纯文本（复用 rag.py 的逻辑，支持 PDF）"""
+        from tools.rag import _read_text
+        return _read_text(file_path)
 
     @staticmethod
     def _extract_claims(text: str) -> list[dict]:
@@ -291,52 +291,18 @@ class VerifyCitationsTool(Tool):
 
     @staticmethod
     def _index_reference(ref_key: str, file_path: str):
-        """为单篇文献建立向量索引（带缓存）"""
-        from core.embeddings import VectorStore
-        from tools.rag import _get_embed_client, _read_docx_text
+        """为单篇文献建立向量索引（复用 rag.py 多文献库，支持 PDF）"""
+        from tools.rag import (
+            _index_one_literature, _literature_stores,
+        )
 
-        abs_path = os.path.abspath(file_path)
-        cache_path = VectorStore.get_cache_path(abs_path)
+        # 如果已经在多文献库中，直接复用
+        if ref_key in _literature_stores:
+            logger.info("[CitationVerifier] 文献 [%s] 已在文献库中复用", ref_key)
+            return _literature_stores[ref_key]
 
-        # 尝试从缓存加载
-        cached = VectorStore.load_cache(cache_path)
-        if cached and cached._source_file == abs_path:
-            logger.info("[CitationVerifier] 文献 [%s] 从缓存加载 (%d 块)", ref_key, len(cached))
-            return cached
-
-        # 读取 + 切块 + Embedding
-        text = _read_docx_text(file_path)
-        if not text.strip():
-            raise ValueError(f"文献 [{ref_key}] 内容为空")
-
-        # 优先语义切块
-        embed_client = _get_embed_client()
-        try:
-            from core.semantic_chunker import semantic_chunk
-            chunk_dicts = semantic_chunk(text, embed_client)
-            if not chunk_dicts:
-                from tools.rag import _chunk_text
-                chunk_dicts = _chunk_text(text, chunk_size=500, overlap=50)
-        except Exception:
-            from tools.rag import _chunk_text
-            chunk_dicts = _chunk_text(text, chunk_size=500, overlap=50)
-
-        chunk_texts = [c["text"] for c in chunk_dicts]
-        chunk_metadata = [{"index": c["index"], "ref_key": ref_key} for c in chunk_dicts]
-
-        embeddings = embed_client.embed_batch(chunk_texts)
-
-        store = VectorStore()
-        store._source_file = abs_path
-        store.add(chunk_texts, embeddings, chunk_metadata)
-
-        try:
-            store.save_cache(cache_path)
-        except Exception:
-            pass
-
-        logger.info("[CitationVerifier] 文献 [%s] 索引完成 (%d 块)", ref_key, len(store))
-        return store
+        _index_one_literature(ref_key, file_path)
+        return _literature_stores[ref_key]
 
     @staticmethod
     def _search_evidence(store, query: str, top_k: int = 3) -> list[dict]:
@@ -479,3 +445,150 @@ class VerifyCitationsTool(Tool):
             lines.append("")
 
         return "\n".join(lines)
+
+
+class CheckClaimTool(Tool):
+    """
+    单句级引用忠实度校验（用户主动触发）。
+
+    用户写了一句带 [N] 的话（如"MIMO 技术提升30%吞吐量[1]"），
+    本工具自动在文献 [N] 的向量库中检索证据，由 LLM 判决是否忠实。
+    需要先用 index_literature 为对应文献建立索引。
+    """
+
+    name = "check_claim"
+    description = (
+        "校验一句带引用标记的主张是否忠实于原文文献。"
+        "例如用户写了'MIMO技术提升30%吞吐量[1]'，本工具会在文献[1]中检索并判断是否准确。"
+        "需要先用 index_literature 索引对应文献。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "claim": {
+                "type": "string",
+                "description": "带引用标记的主张句，如 'MIMO 技术可提升30%吞吐量[1]'",
+            },
+            "top_k": {
+                "type": "integer",
+                "description": "每个引用检索的原文段落数量，默认 3",
+            },
+        },
+        "required": ["claim"],
+    }
+
+    def __init__(self, llm=None):
+        self._llm = llm
+
+    def execute(self, claim: str, top_k: int = 3, **kwargs) -> str:
+        from tools.rag import _literature_stores, _literature_meta, _get_embed_client
+
+        if self._llm is None:
+            return "❌ LLM 未注入，无法执行忠实度判决"
+
+        # 1. 提取引用编号
+        matches = list(_CITE_PATTERN.finditer(claim))
+        if not matches:
+            return "ℹ️ 未检测到引用标记（如 [1]）。请确保主张句中包含方括号引用编号。"
+
+        ref_keys = set()
+        for m in matches:
+            inner = m.group(1)
+            for part in re.split(r'[,，]', inner):
+                part = part.strip()
+                range_match = re.match(r'(\d+)\s*[-~～\u2013\u2014]\s*(\d+)', part)
+                if range_match:
+                    for n in range(int(range_match.group(1)), int(range_match.group(2)) + 1):
+                        ref_keys.add(str(n))
+                elif part.isdigit():
+                    ref_keys.add(part)
+
+        if not ref_keys:
+            return "ℹ️ 未能从引用标记中解析出有效编号。"
+
+        # 2. 逐个引用编号检索 + 判决
+        results = []
+        for rk in sorted(ref_keys, key=int):
+            if rk not in _literature_stores:
+                results.append(f"⏭️ [{rk}] 文献未索引，跳过。请先 index_literature。")
+                continue
+
+            store = _literature_stores[rk]
+            title = _literature_meta.get(rk, {}).get("title", "")
+
+            # 检索
+            try:
+                embed_client = _get_embed_client()
+                query_embedding = embed_client.embed(claim)
+                evidence = store.search(query_embedding, top_k=top_k)
+            except Exception as e:
+                results.append(f"❌ [{rk}] 检索失败: {e}")
+                continue
+
+            if not evidence:
+                results.append(f"🚫 [{rk}]{' ' + title if title else ''} — 原文中未找到相关段落，引用可能不准确。")
+                continue
+
+            # LLM 判决（复用 VerifyCitationsTool 的方法）
+            verdict = self._verify_one(claim, rk, evidence)
+
+            # 格式化结果
+            icon = {
+                "FAITHFUL": "✅",
+                "MINOR_ISSUE": "⚠️",
+                "MAJOR_ISSUE": "❌",
+                "UNSUPPORTED": "🚫",
+            }.get(verdict.get("verdict", ""), "❓")
+
+            header = f"{icon} [{rk}]{' ' + title if title else ''} — {verdict.get('verdict', 'UNKNOWN')}"
+            parts = [header]
+            if verdict.get("analysis"):
+                parts.append(f"  分析: {verdict['analysis']}")
+            issues = verdict.get("issues", [])
+            if issues:
+                for iss in issues:
+                    parts.append(f"  - {iss}")
+            # 附最相关原文片段
+            if evidence:
+                snippet = evidence[0]["chunk"][:200]
+                parts.append(f"  原文: {snippet}...")
+
+            results.append("\n".join(parts))
+
+        return "\n\n".join(results)
+
+    def _verify_one(self, claim: str, ref_key: str, evidence: list[dict]) -> dict:
+        """调用 LLM 做单条忠实度判决"""
+        import json as _json
+        from core.schema import Message, Role
+
+        evidence_text = ""
+        for i, ev in enumerate(evidence, 1):
+            score_pct = round(ev.get("score", 0) * 100, 1)
+            evidence_text += f"### 段落 {i}（相关度: {score_pct}%）\n{ev['chunk']}\n\n"
+
+        prompt = _VERIFICATION_PROMPT.format(
+            claim=claim,
+            ref_key=ref_key,
+            evidence=evidence_text,
+        )
+
+        try:
+            response = self._llm.chat([
+                Message(role=Role.SYSTEM, content="你是一位严格的学术审稿人。只输出 JSON。"),
+                Message(role=Role.USER, content=prompt),
+            ])
+            resp_text = response.content or ""
+            json_match = re.search(r'\{[\s\S]*\}', resp_text)
+            if json_match:
+                parsed = _json.loads(json_match.group())
+                return {
+                    "verdict": parsed.get("verdict", "UNKNOWN"),
+                    "confidence": parsed.get("confidence", 0.0),
+                    "analysis": parsed.get("analysis", ""),
+                    "issues": parsed.get("issues", []),
+                }
+        except Exception as e:
+            logger.warning("[CheckClaim] LLM 判决失败: %s", e)
+
+        return {"verdict": "ERROR", "confidence": 0.0, "analysis": "LLM 判决调用失败", "issues": []}

@@ -75,16 +75,8 @@ class LLM:
             base_url=base_url,
             api_key=self._api_keys[self._current_key_index],
         )
-
-        # 异步客户端（用于 chat_stream）
-        try:
-            from openai import AsyncOpenAI
-            self.async_client = AsyncOpenAI(
-                base_url=base_url,
-                api_key=self._api_keys[self._current_key_index],
-            )
-        except ImportError:
-            self.async_client = None
+        # 异步客户端延迟初始化（chat_stream 首次调用时创建）
+        self._async_client = None
 
     def _switch_to_next_key(self) -> bool:
         """
@@ -105,16 +97,8 @@ class LLM:
             base_url=self.base_url,
             api_key=self._api_keys[self._current_key_index],
         )
-
-        # 同步切换异步客户端
-        try:
-            from openai import AsyncOpenAI
-            self.async_client = AsyncOpenAI(
-                base_url=self.base_url,
-                api_key=self._api_keys[self._current_key_index],
-            )
-        except ImportError:
-            self.async_client = None
+        # Key 切换后异步客户端需要重建
+        self._async_client = None
 
         # 只显示 Key 的前8个字符用于调试
         key_preview = self._api_keys[self._current_key_index][:8] + "..."
@@ -124,25 +108,30 @@ class LLM:
         )
         return True
     
-    async def chat_stream(self, messages: list[dict], tools: Optional[list[dict]] = None):
-        """返回异步生成器，流式吐出 chunk"""
-        if self.async_client is None:
-            raise RuntimeError(
-                "AsyncOpenAI 客户端不可用，请确保 openai>=1.0.0 已安装"
+    def _ensure_async_client(self):
+        """延迟创建 AsyncOpenAI 客户端（chat_stream 专用）。"""
+        if self._async_client is None:
+            from openai import AsyncOpenAI
+            self._async_client = AsyncOpenAI(
+                base_url=self.base_url,
+                api_key=self._api_keys[self._current_key_index],
             )
+        return self._async_client
 
-        kwargs = {
-            "model": self.model,
-            "messages": messages,
-            "stream": True  # 强制开启流式
-        }
+    async def chat_stream(self, messages: list[dict], tools=None):
+        """
+        异步流式调用 LLM（返回 AsyncStream，可 async for 消费）。
+
+        关键：必须使用 AsyncOpenAI 客户端。
+        同步 OpenAI 的 .create(stream=True) 返回同步 Stream 对象，
+        不能 await 也不能 async for，会直接 TypeError。
+        """
+        kwargs = {"model": self.model, "messages": messages, "stream": True}
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
-
-        # 使用异步客户端发起流式请求
-        stream = await self.async_client.chat.completions.create(**kwargs)
-        return stream
+        client = self._ensure_async_client()
+        return await client.chat.completions.create(**kwargs)
 
     def _is_key_error(self, error: Exception) -> bool:
         """判断错误是否是 Key 失效/过期类型"""

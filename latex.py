@@ -67,6 +67,22 @@ def set_clipboard(text):
             time.sleep(0.1)
     return False
 
+def _force_foreground(hwnd):
+    """
+    强制将窗口拉到前台，即使当前进程不是前台进程。
+
+    Windows 限制：只有前台进程才能调用 SetForegroundWindow。
+    绕法：模拟一次 Alt 键按下/释放，让系统认为本进程刚收到用户输入，
+    从而获得 SetForegroundWindow 权限。
+    """
+    VK_MENU = 0x12          # Alt 键虚拟键码
+    KEYEVENTF_EXTENDEDKEY = 0x0001
+    KEYEVENTF_KEYUP       = 0x0002
+
+    user32.keybd_event(VK_MENU, 0, KEYEVENTF_EXTENDEDKEY, 0)
+    user32.SetForegroundWindow(hwnd)
+    user32.keybd_event(VK_MENU, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
+
 def activate_mathtype_window(shell, max_wait=10):
     """等待并激活 MathType 编辑器窗口。"""
     for _ in range(max_wait * 2):
@@ -75,9 +91,9 @@ def activate_mathtype_window(shell, max_wait=10):
             mt_wins = find_windows(title_contains="MathType")
 
         if mt_wins:
-            mt_title = mt_wins[0][1]
+            hwnd, mt_title, _ = mt_wins[0]
             try:
-                shell.AppActivate(mt_title)
+                _force_foreground(hwnd)
                 return True, mt_title
             except Exception:
                 pass
@@ -209,16 +225,33 @@ def prompt_formula_selection(formulas):
     return excluded
 
 
-def convert_one_formula(word, doc, shell, formula_index, skip=False):
+def _ping(progress_callback, stage: str, formula_index: int, total: int):
+    """安全转发进度回调（异常不阻塞主流程）。"""
+    if progress_callback is None:
+        return
+    try:
+        progress_callback(formula_index, total, stage)
+    except Exception:
+        pass
+
+
+def convert_one_formula(word, doc, shell, formula_index, skip=False,
+                         progress_callback=None, total_formulas=0):
     """
     转换单个公式。
     使用 Range-based Find + 位置锚定实现原地替换。
+
+    Args:
+        progress_callback: 可选，签名 (current_index, total, stage_str)。
+            在关键节点被调用，用于驱动 Agent 看门狗心跳。
+        total_formulas: 本次待转换公式总数（仅用于进度计算）。
 
     返回: (should_continue, was_converted, is_nonempty)
       - should_continue: 是否继续搜索下一个公式
       - was_converted:   本次是否成功转换了一个公式
       - is_nonempty:     找到的公式是否非空（用于排除编号计数）
     """
+    _ping(progress_callback, "find", formula_index, total_formulas)
     # 1. 从当前光标位置到文档末尾创建搜索范围
     #    使用 Range.Find 而非 Selection.Find，避免选区干扰
     cursor_pos = word.Selection.Start
@@ -344,6 +377,7 @@ def convert_one_formula(word, doc, shell, formula_index, skip=False):
     except Exception:
         pass
 
+    _ping(progress_callback, "ole_insert", formula_index, total_formulas)
     try:
         # 通过当前 Selection 位置插入 OLE，不指定 Range 参数
         word.Selection.InlineShapes.AddOLEObject(
@@ -358,6 +392,7 @@ def convert_one_formula(word, doc, shell, formula_index, skip=False):
         return True, False, True
 
     # 6. 自动化 MathType：等待窗口打开 -> 粘贴 LaTeX -> 关闭
+    _ping(progress_callback, "mathtype_open", formula_index, total_formulas)
     activated, mt_title = activate_mathtype_window(shell)
     if not activated:
         print(f"    ❌ MathType 未响应，删除空 OLE 并恢复原始文本")
@@ -373,6 +408,7 @@ def convert_one_formula(word, doc, shell, formula_index, skip=False):
         shell.SendKeys("^v")      # Ctrl+V 粘贴
         time.sleep(0.8)
         shell.SendKeys("^{F4}")   # Ctrl+F4 关闭并更新
+        _ping(progress_callback, "mathtype_close", formula_index, total_formulas)
         if not wait_mathtype_closed():
             print(f"    ❌ MathType 未正常关闭，删除空 OLE 并恢复原始文本")
             _remove_ole_and_restore(word, insert_pos, sel_text)
@@ -412,12 +448,27 @@ def select_file_dialog():
     return file_path
 
 
-def main():
+def main(progress_callback=None, excluded_indices=None):
+    """
+    主转换流程。
+
+    Args:
+        progress_callback: 可选，签名 (current_index, total, stage_str)。
+            非空时视为“被程序调用”（Agent 工具场景）：
+            - 自动跳过所有 input() 交互（模式选择 / 排除编号）
+            - 在扫描、每个公式转换、定期保存节点回调以驱动看门狗心跳
+        excluded_indices: 可选，要排除的公式编号集合（仅在 callback 模式下生效）。
+            默认空集（即全部转换）。CLI 交互模式下忽略此参数，使用用户输入。
+    """
     MAX_FORMULAS = 5000  # 安全上限，防止死循环
+    is_programmatic = progress_callback is not None
 
     # 1. 参数解析与文件选择
     if len(sys.argv) >= 2 and not sys.argv[1].startswith("--"):
         input_path = os.path.abspath(sys.argv[1])
+    elif is_programmatic:
+        print("❌ 程序调用模式下必须通过 sys.argv 传入 file_path")
+        return
     else:
         print("📂 请在弹出的对话框中选择要处理的 Word 文档...")
         input_path = select_file_dialog()
@@ -431,13 +482,17 @@ def main():
     # 2. 模式选择
     overwrite_mode = "--overwrite" in sys.argv
     if not overwrite_mode and "--safe" not in sys.argv:
-        print(f"\n📄 已选择: {os.path.basename(input_path)}")
-        print(f"   路径: {input_path}")
-        print(f"\n请选择转换模式:")
-        print(f"  1. 安全模式 — 生成新文件 xxx_converted.docx（推荐）")
-        print(f"  2. 覆盖模式 — 修改原文件（自动备份为 xxx_backup）")
-        choice = input("\n请输入 1 或 2 (默认 1): ").strip()
-        overwrite_mode = choice == "2"
+        if is_programmatic:
+            # 程序调用：默认安全模式（避免覆盖原文件的意外）
+            overwrite_mode = False
+        else:
+            print(f"\n📄 已选择: {os.path.basename(input_path)}")
+            print(f"   路径: {input_path}")
+            print(f"\n请选择转换模式:")
+            print(f"  1. 安全模式 — 生成新文件 xxx_converted.docx（推荐）")
+            print(f"  2. 覆盖模式 — 修改原文件（自动备份为 xxx_backup）")
+            choice = input("\n请输入 1 或 2 (默认 1): ").strip()
+            overwrite_mode = choice == "2"
 
     # 3. 启动信息
     print("=" * 60)
@@ -504,15 +559,21 @@ def main():
 
         # ---- 预扫描阶段 ----
         print(f"\n🔍 正在扫描文档中的公式...")
+        _ping(progress_callback, "scan", 0, 0)
         formulas = scan_all_formulas(word, doc)
+        _ping(progress_callback, "scan_done", 0, len(formulas))
 
         if not formulas:
             print(f"\n⚠️ 未找到任何 $...$ 或 $$...$$ 公式。")
             print(f"📄 文档已正常打开: {output_path}")
             return
 
-        excluded_indices = prompt_formula_selection(formulas)
-        to_convert = len(formulas) - len(excluded_indices)
+        # 排除编号：程序调用模式使用传入值，否则交互询问
+        if is_programmatic:
+            excluded = set(excluded_indices) if excluded_indices else set()
+        else:
+            excluded = prompt_formula_selection(formulas)
+        to_convert = len(formulas) - len(excluded)
         if to_convert == 0:
             print(f"\n⚠️ 所有公式均已排除，无需转换。")
             print(f"📄 文档已正常打开: {output_path}")
@@ -527,19 +588,23 @@ def main():
         skipped = 0
         user_excluded = 0
         total_iter = 0
+        total_formulas = len(formulas)
 
         while total_iter < MAX_FORMULAS:
             total_iter += 1
-            should_skip = (formula_number + 1) in excluded_indices
+            should_skip = (formula_number + 1) in excluded
 
             should_continue, converted, is_nonempty = convert_one_formula(
-                word, doc, shell, formula_number + 1, skip=should_skip
+                word, doc, shell, formula_number + 1, skip=should_skip,
+                progress_callback=progress_callback, total_formulas=total_formulas,
             )
             if not should_continue:
                 break
 
             if is_nonempty:
                 formula_number += 1
+                stage = "converted" if converted else ("excluded" if should_skip else "skipped")
+                _ping(progress_callback, stage, formula_number, total_formulas)
                 if converted:
                     count += 1
                 elif should_skip:
@@ -549,9 +614,11 @@ def main():
 
             # 定期保存
             if count > 0 and count % 5 == 0:
+                _ping(progress_callback, "save", formula_number, total_formulas)
                 doc.Save()
 
         doc.Save()
+        _ping(progress_callback, "done", formula_number, total_formulas)
         print(f"\n✅ 全部完成！共转换 {count} 个公式。")
         if user_excluded > 0:
             print(f"   (用户排除 {user_excluded} 个)")

@@ -9,13 +9,13 @@
 
 | # | 主题 | 文件 | 关键词 |
 |---|------|------|--------|
-| 1 | [项目概述与架构](./01-项目概述与架构.md) | `01-项目概述与架构.md` | ReAct、整体设计、技术选型 |
-| 2 | [ReAct Agent 核心](./02-ReAct-Agent核心.md) | `02-ReAct-Agent核心.md` | 推理循环、Think-Act-Observe |
-| 3 | [Multi-Agent 协作](./03-Multi-Agent协作.md) | `03-Multi-Agent协作.md` | Planner-Executor-Reviewer、回溯 |
-| 4 | [安全沙盒系统](./04-安全沙盒系统.md) | `04-安全沙盒系统.md` | AST、进程隔离、Docker |
-| 5 | [工具系统](./05-工具系统.md) | `05-工具系统.md` | Tool 基类、动态创建、审批 |
-| 6 | [记忆与技能系统](./06-记忆与技能系统.md) | `06-记忆与技能系统.md` | 持久化、RAG、Skill 匹配 |
-| 7 | [错误处理与容错](./07-错误处理与容错.md) | `07-错误处理与容错.md` | 三级分类、结构化恢复、Checkpoint |
+| 1 | [项目概述与架构](./01-项目概述与架构.md) | `01-项目概述与架构.md` | ReAct、Coordinator-Worker Swarm、技术选型 |
+| 2 | [ReAct Agent 核心](./02-ReAct-Agent核心.md) | `02-ReAct-Agent核心.md` | 推理循环、run_async 流式状态机、Token 压缩、L1 三明治注入、心跳看门狗 |
+| 3 | [Multi-Agent 协作](./03-Multi-Agent协作.md) | `03-Multi-Agent协作.md` | Coordinator-Worker Swarm、delegate_task、工作区隔离、角色 Prompt |
+| 4 | [安全沙盒系统](./04-安全沙盒系统.md) | `04-安全沙盒系统.md` | AST、进程隔离、Docker、COMSafeLock |
+| 5 | [工具系统](./05-工具系统.md) | `05-工具系统.md` | Tool 基类、动态创建、RAG 文献库、引用审计、完整工具清单 |
+| 6 | [记忆与技能系统](./06-记忆与技能系统.md) | `06-记忆与技能系统.md` | 三级记忆、RAG、Skill 匹配、Prompt Cache |
+| 7 | [错误处理与容错](./07-错误处理与容错.md) | `07-错误处理与容错.md` | 三级分类、结构化恢复、Word 兜底关闭、工作区事务回滚 |
 | 11 | [语义分块与重排版架构](./11-语义分块与重排版架构.md) | `11-语义分块与重排版架构.md` | 语义切块、动态批处理、背压防 OOM |
 
 ### 项目二：商城秒杀系统（后端工程）
@@ -39,9 +39,9 @@
 
 ```
 === Agent 项目 ===
-Day 1: 01-架构 + 02-ReAct → 理解全貌
-Day 2: 03-Multi-Agent + 07-错误 → 掌握流水线
-Day 3: 06-记忆技能 + 04-沙盒 + 05-工具 → 精通子系统
+Day 1: 01-架构 + 02-ReAct → 理解全貌（含流式状态机、Token 压缩）
+Day 2: 03-Multi-Agent + 07-错误 → 掌握 Coordinator-Worker Swarm
+Day 3: 06-记忆技能 + 04-沙盒 + 05-工具 → 精通子系统（含完整工具清单）
 Day 4: 11-语义分块 + 08-八股文 → 补齐通用知识
 
 === 秒杀项目 ===

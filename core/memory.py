@@ -749,17 +749,18 @@ class Memory:
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
         for i in promoted:
             chunk = self._vector_store.chunks[i]
+            # 👑 先读后写（两步）：虽然 Python 先求值右侧再赋值，
+            # 把旧值查询写在新 dict literal 里语义正确但极易误导 code review，
+            # 故显式拆成两步以免未来维护者误判为"读已被覆盖的值"。
+            old_recall = self._vector_store.metadata[i].get("recall_count", 0)
             logger.info("  [Memory] L3 → L2 晋升（recall=%d）: %s",
-                        self._vector_store.metadata[i].get("recall_count", 0),
-                        chunk[:60])
+                        old_recall, chunk[:60])
             # 将 L3 直接升级为 L2（原地修改 metadata）
             self._vector_store.metadata[i] = {
                 "type": "reflection",
                 "time": now_str,
                 "source": "promotion",
-                "original_recall_count": self._vector_store.metadata[i].get(
-                    "recall_count", 0
-                ),
+                "original_recall_count": old_recall,
             }
 
         self._vector_store.save_cache(self._vector_cache_path)
