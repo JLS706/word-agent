@@ -1,14 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-Tool: Agent 自学习规则系统
-让 Agent 能将运行中"领悟"到的经验保存下来，
-下次启动时自动加载到 System Prompt 中，实现持续自我进化。
+Tool: Agent 自学习规则系统 + L1 用户画像
 
-存储位置: memory/learned_rules.json
+v1: learned_rules.json — 逐条铁律（旧版，保留向后兼容）
+v2: user_profile.md    — Markdown 用户画像（新版，LLM 增量更新）
+
+旧版工具 (SaveLearnedRuleTool / ForgetLearnedRuleTool / ListLearnedRulesTool) 保留兼容。
+新版工具 (UpdateProfileTool / ViewProfileTool) 用于管理 .md 画像。
+
+首次启动时，如果存在旧 learned_rules.json 但不存在 user_profile.md，
+会自动将旧规则迁移到画像的 ## 铁律 section。
+
+存储位置:
+  - memory/learned_rules.json  (旧版，向后兼容)
+  - memory/user_profile.md     (新版，L1 用户画像)
 """
 
 import json
 import os
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -17,6 +27,10 @@ from tools.base import Tool
 # 规则文件路径（相对于项目根目录的 memory 文件夹）
 _AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RULES_FILE = os.path.join(_AGENT_DIR, "memory", "learned_rules.json")
+PROFILE_FILE = os.path.join(_AGENT_DIR, "memory", "user_profile.md")
+
+# 画像字数上限（防膨胀）
+PROFILE_MAX_CHARS = 1500
 
 # 最大规则数量（防止 prompt 膨胀）
 MAX_RULES = 30
@@ -349,3 +363,237 @@ class ListLearnedRulesTool(Tool):
                 line += f"\n     保存时间：{rule['created_at']}"
             lines.append(line)
         return "\n".join(lines)
+
+
+# ═════════════════════════════════════════════
+# L1 用户画像引擎 (v2)
+# ═════════════════════════════════════════════
+
+_DEFAULT_PROFILE = """\
+# 用户画像
+
+## 基本信息
+- （Agent 会在交互过程中自动补充）
+
+## 写作偏好
+- （尚未记录）
+
+## 铁律（绝对禁止项）
+- 处理完文档后必须关闭 Word 进程
+- 不得删除用户未明确要求删除的内容
+
+## 历史踩坑
+- （尚未记录）
+"""
+
+
+def load_profile() -> str:
+    """加载用户画像。不存在时自动创建默认模板（含旧规则迁移）。"""
+    if os.path.exists(PROFILE_FILE):
+        try:
+            with open(PROFILE_FILE, "r", encoding="utf-8") as f:
+                return f.read()
+        except IOError:
+            pass
+
+    # 首次启动：尝试从旧 learned_rules.json 迁移
+    profile = _migrate_from_rules()
+    save_profile(profile)
+    return profile
+
+
+def save_profile(content: str):
+    """持久化保存画像到 .md 文件。"""
+    os.makedirs(os.path.dirname(PROFILE_FILE), exist_ok=True)
+    with open(PROFILE_FILE, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def _migrate_from_rules() -> str:
+    """将旧 learned_rules.json 迁移为画像的 ## 铁律 section。"""
+    rules = _load_rules()
+    if not rules:
+        return _DEFAULT_PROFILE
+
+    rule_lines = "\n".join(f"- {r['rule']}" for r in rules)
+    profile = _DEFAULT_PROFILE
+
+    # 替换默认铁律 section
+    old_section = (
+        "## 铁律（绝对禁止项）\n"
+        "- 处理完文档后必须关闭 Word 进程\n"
+        "- 不得删除用户未明确要求删除的内容"
+    )
+    new_section = f"## 铁律（绝对禁止项）\n{rule_lines}"
+    profile = profile.replace(old_section, new_section)
+    return profile
+
+
+def load_profile_for_prompt() -> str:
+    """
+    加载画像，格式化为可注入 System Prompt 的文本段落。
+    供 prompt.py 调用（替代 load_rules_for_prompt）。
+    """
+    profile = load_profile()
+    if not profile or not profile.strip():
+        return ""
+
+    return (
+        "## 🧠 用户画像 (L1 — 最高优先级)\n\n"
+        "以下是你对这位用户的了解。请据此提供个性化服务。\n"
+        "⚠️ 其中「铁律」部分具有一票否决权，与任何其他信息冲突时无条件以铁律为准。\n\n"
+        f"{profile.strip()}"
+    )
+
+
+def extract_taboos_from_profile(profile: str = "") -> list[str]:
+    """
+    从画像中提取 ## 铁律 section 的条目（供三明治注入和后校验使用）。
+
+    Returns:
+        铁律文本列表，如 ["处理完文档后必须关闭 Word 进程", ...]
+    """
+    if not profile:
+        profile = load_profile()
+
+    match = re.search(
+        r"##\s*铁律[^\n]*\n(.*?)(?=\n##|\Z)",
+        profile,
+        re.DOTALL,
+    )
+    if not match:
+        return []
+
+    lines = match.group(1).strip().split("\n")
+    taboos = []
+    for line in lines:
+        line = line.strip()
+        if line.startswith("- "):
+            taboos.append(line[2:].strip())
+        elif line.startswith("* "):
+            taboos.append(line[2:].strip())
+        elif line and not line.startswith("#"):
+            taboos.append(line)
+    return [t for t in taboos if t]
+
+
+# ─────────────────────────────────────────────
+# Tool 4: 更新用户画像（LLM 增量重写）
+# ─────────────────────────────────────────────
+
+class UpdateProfileTool(Tool):
+    name = "update_profile"
+    description = (
+        "更新 L1 用户画像。当你在交互中发现了用户的新偏好、写作习惯、导师要求、"
+        "或需要新增/修改铁律时，调用此工具。\n\n"
+        "你需要提供一段新发现的信息（new_info），工具会让 LLM 读取旧画像并增量更新。\n"
+        "画像有字数上限（1500字），LLM 会自动精炼冗余内容。\n\n"
+        "使用场景：\n"
+        "- 用户透露了身份/导师/研究方向等信息\n"
+        "- 用户表达了长期写作偏好（字体、格式、引用风格）\n"
+        "- 需要新增或修改铁律（绝对禁止项）\n"
+        "- 用户纠正了你的错误，需要记住正确做法"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "new_info": {
+                "type": "string",
+                "description": "新发现的用户信息或偏好，用自然语言描述。",
+            },
+        },
+        "required": ["new_info"],
+    }
+
+    def execute(self, new_info: str) -> str:
+        if not new_info or not new_info.strip():
+            return "❌ 新信息不能为空。"
+
+        old_profile = load_profile()
+
+        try:
+            import toml
+            from core.llm import LLM
+            from core.schema import Message, Role
+
+            config_path = os.path.join(_AGENT_DIR, "config", "config.toml")
+            if not os.path.exists(config_path):
+                return "❌ 配置文件不存在，无法调用 LLM 更新画像。"
+
+            config = toml.load(config_path)
+            llm = LLM(**config.get("llm", {}))
+
+            messages = [
+                Message(role=Role.SYSTEM, content=(
+                    "你是用户画像更新器。给定旧画像和一段新信息，请输出更新后的完整画像。\n\n"
+                    "规则：\n"
+                    "1. 保持 Markdown 格式，保留所有 ## 章节标题\n"
+                    "2. 将新信息融入合适的章节（基本信息/写作偏好/铁律/历史踩坑）\n"
+                    "3. 如果新信息与旧内容矛盾，以新信息为准\n"
+                    "4. 如果新信息是补充，追加到相应章节\n"
+                    f"5. 总字数不超过 {PROFILE_MAX_CHARS} 字，必要时精炼冗余内容\n"
+                    "6. 不要添加任何解释说明，只输出更新后的画像 Markdown 全文\n"
+                    "7. 「## 铁律」章节中的条目必须用 - 开头的列表格式"
+                )),
+                Message(role=Role.USER, content=(
+                    f"旧画像：\n```markdown\n{old_profile}\n```\n\n"
+                    f"新信息：{new_info.strip()}"
+                )),
+            ]
+            response = llm.chat(messages)
+            updated = (response.content or "").strip()
+
+            # 清理 LLM 可能包裹的 ```markdown ... ```
+            if updated.startswith("```"):
+                lines = updated.split("\n")
+                # 去掉首行 ```markdown 和末行 ```
+                if lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].strip() == "```":
+                    lines = lines[:-1]
+                updated = "\n".join(lines).strip()
+
+            if not updated:
+                return "❌ LLM 返回了空内容，画像未更新。"
+
+            # 防膨胀检查
+            if len(updated) > PROFILE_MAX_CHARS * 1.5:
+                return (
+                    f"⚠️ 更新后画像超过字数上限（{len(updated)} > {PROFILE_MAX_CHARS}），"
+                    "未保存。请简化新信息后重试。"
+                )
+
+            save_profile(updated)
+            return (
+                f"✅ 用户画像已更新（{len(updated)} 字）。\n"
+                f"画像将在下次对话时自动注入 System Prompt。"
+            )
+
+        except Exception as e:
+            return f"❌ 画像更新失败: {e}"
+
+
+# ─────────────────────────────────────────────
+# Tool 5: 查看用户画像
+# ─────────────────────────────────────────────
+
+class ViewProfileTool(Tool):
+    name = "view_profile"
+    description = (
+        "查看当前的 L1 用户画像，了解你对这位用户的所有记录。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {},
+    }
+
+    def execute(self) -> str:
+        profile = load_profile()
+        if not profile or not profile.strip():
+            return "📭 用户画像为空。"
+
+        char_count = len(profile)
+        return (
+            f"📋 当前用户画像（{char_count}/{PROFILE_MAX_CHARS} 字）：\n\n"
+            f"{profile}"
+        )

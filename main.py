@@ -78,7 +78,8 @@ def create_agent(config: dict, dry_run: bool = False):
     from tools.memory_tool import RecallHistoryTool, SavePreferenceTool
     from tools.code_interpreter import CodeInterpreterTool
     from tools.learned_rules import (
-        SaveLearnedRuleTool, ForgetLearnedRuleTool, ListLearnedRulesTool
+        SaveLearnedRuleTool, ForgetLearnedRuleTool, ListLearnedRulesTool,
+        UpdateProfileTool, ViewProfileTool,
     )
     from tools.rag import IndexDocumentTool, SearchDocumentTool
     from tools.rag import IndexLiteratureTool, SearchLiteratureTool, ListLiteratureTool, AutoBindLiteratureTool
@@ -127,9 +128,11 @@ def create_agent(config: dict, dry_run: bool = False):
     registry.register(AcronymCheckerTool())
     registry.register(LatexConverterTool())
     registry.register(CodeInterpreterTool())        # 安全沙盒代码解释器
-    registry.register(SaveLearnedRuleTool())         # 自学习：保存规则
-    registry.register(ForgetLearnedRuleTool())       # 自学习：删除规则
-    registry.register(ListLearnedRulesTool())        # 自学习：列出规则
+    registry.register(SaveLearnedRuleTool())         # 自学习：保存规则（旧版兼容）
+    registry.register(ForgetLearnedRuleTool())       # 自学习：删除规则（旧版兼容）
+    registry.register(ListLearnedRulesTool())        # 自学习：列出规则（旧版兼容）
+    registry.register(UpdateProfileTool())           # L1 画像：增量更新
+    registry.register(ViewProfileTool())             # L1 画像：查看
     registry.register(IndexDocumentTool())           # RAG：文档索引
     registry.register(SearchDocumentTool())          # RAG：语义搜索
     registry.register(IndexLiteratureTool())          # 文献库：索引单篇文献（PDF/Word）

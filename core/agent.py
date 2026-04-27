@@ -188,6 +188,31 @@ class Agent:
             logger.info("🧠 Agent 收到指令: %s", user_input)
             logger.info("=" * 60)
 
+        # ── Coordinator 路由分支（同步版）──
+        is_coordinator = self.tools.get("delegate_task") is not None
+        if is_coordinator:
+            try:
+                from core.router import classify_intent, TaskIntent, TaskFSM
+
+                intent, router_file, reason = classify_intent(
+                    self.llm, user_input,
+                    history_context=self._session_file or "",
+                )
+                logger.info("🚦 意图: %s — %s", intent.value, reason)
+
+                if router_file:
+                    self._session_file = router_file
+
+                if intent != TaskIntent.TASK_SIMPLE and self._session_file:
+                    return self._run_fsm_pipeline_sync(
+                        TaskFSM(intent, user_input, self._session_file),
+                        user_input,
+                    )
+                elif intent != TaskIntent.TASK_SIMPLE and not self._session_file:
+                    logger.warning("[Router] 需要文件但未指定，降级为 ReAct")
+            except Exception as e:
+                logger.warning("[Router] 路由异常，降级为 ReAct: %s", e)
+
         openai_tools = self.tools.to_openai_tools()
 
         for step in range(1, self.max_steps + 1):
@@ -631,28 +656,34 @@ class Agent:
             return ""
 
         try:
-            from tools.learned_rules import _load_rules
-            rules = _load_rules()
+            from tools.learned_rules import extract_taboos_from_profile, _load_rules
+            # 优先从画像铁律读取，回退到旧 JSON rules
+            taboos = extract_taboos_from_profile()
+            if taboos:
+                rule_texts = taboos
+            else:
+                rules = _load_rules()
+                rule_texts = [r["rule"] for r in rules] if rules else []
         except Exception:
             return ""
 
-        if not rules:
+        if not rule_texts:
             return ""
 
         used_tools = set(self._session_tools)
         violations = []
 
-        for rule in rules:
-            rule_text = rule["rule"].lower()
+        for rule_text in rule_texts:
+            rule_lower = rule_text.lower()
 
             # ── 注意：Word 进程关闭已迁移到 run()/run_async() 的 finally 块，
             #   作为确定性流程处理（带超时保护，不依赖 learned_rules 记忆）。
             #   此处仅保留其他可扩展规则模式的位置。
 
             # ── 未来可扩展更多规则模式 ──
-            # if "其他关键词" in rule_text:
+            # if "其他关键词" in rule_lower:
             #     ...
-            _ = rule_text  # 占位避免 lint 警告
+            _ = rule_lower  # 占位避免 lint 警告
 
         return "\n".join(violations)
 
@@ -811,6 +842,192 @@ class Agent:
         self._retry_counts = {}
         self._active_config = {}
 
+    # ─────────────────────────────────────────────
+    # FSM Pipeline：Python 状态机驱动的 Worker 调度链
+    # ─────────────────────────────────────────────
+
+    def _run_fsm_pipeline_sync(self, fsm, user_input: str) -> str:
+        """FSM Pipeline 的同步版（供已废弃的 run() 使用）。"""
+        delegate_tool = self.tools.get("delegate_task")
+        if not delegate_tool:
+            return "❌ FSM 需要 delegate_task 工具，但未注册。"
+
+        logger.info("🚂 FSM 接管: %s → 共 %d 步", fsm.intent.value, fsm.total_steps)
+
+        for role, objective in fsm:
+            logger.info("[FSM] Step %d/%d: %s", fsm.current_step + 1, fsm.total_steps, role)
+            try:
+                raw_report = delegate_tool.execute(
+                    role=role,
+                    objective=objective,
+                    target_file=fsm.target_file,
+                )
+                import json as _json
+                try:
+                    report_dict = _json.loads(raw_report)
+                except (ValueError, TypeError):
+                    report_dict = {"status": "UNKNOWN", "summary": str(raw_report)[:200]}
+            except Exception as e:
+                report_dict = {"status": "FAIL", "summary": f"Worker 崩溃: {e}"}
+
+            fsm.feed_report(report_dict)
+
+        fsm_summary = fsm.build_summary()
+        logger.info(fsm_summary)
+
+        # 让 LLM 生成最终回答
+        self.history.append(Message(
+            role=Role.TOOL, content=fsm_summary,
+            tool_call_id="fsm_pipeline", name="fsm_pipeline",
+        ))
+        self.history.append(Message(
+            role=Role.USER,
+            content="上方是 FSM 状态机自动执行的结果摘要。请用简洁的中文向用户汇报。",
+        ))
+        try:
+            response = self.llm.chat(self.history)
+            self.history.append(response)
+            final_answer = response.content or fsm_summary
+        except Exception:
+            final_answer = fsm_summary
+
+        self.state = AgentState.FINISHED
+        self._save_session(user_input, final_answer)
+        return final_answer
+
+    async def _run_fsm_pipeline(
+        self,
+        fsm,
+        user_input: str,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """
+        FSM 驱动的 Worker 调度链（第二层：Python 硬接管）。
+
+        遍历 FSM 的每一步，程序化调用 delegate_task，
+        而非让 LLM 自由决定是否 fork Worker。
+
+        大模型只负责「选轨道」，轨道上有几个检查站由代码焊死。
+        """
+        delegate_tool = self.tools.get("delegate_task")
+        if not delegate_tool:
+            yield StreamEvent("error", "FSM 需要 delegate_task 工具，但未注册。")
+            return
+
+        yield StreamEvent(
+            "text",
+            f"🚂 FSM 接管: {fsm.intent.value} → 共 {fsm.total_steps} 步\n\n",
+        )
+
+        for role, objective in fsm:
+            step_num = fsm.current_step + 1
+            yield StreamEvent(
+                "text",
+                f"--- Step {step_num}/{fsm.total_steps}: **{role}** ---\n",
+            )
+
+            # ── 程序化调用 delegate_task（通过线程池，不阻塞事件循环）──
+            progress_queue: _thread_queue.Queue = _thread_queue.Queue()
+            wake_event = asyncio.Event()
+            loop = asyncio.get_running_loop()
+
+            def _progress_cb(pct, msg, metadata=None,
+                             _q=progress_queue, _ev=wake_event, _loop=loop):
+                _q.put_nowait((pct, msg, metadata or {}))
+                _loop.call_soon_threadsafe(_ev.set)
+
+            delegate_tool._progress_callback = _progress_cb
+
+            task = asyncio.create_task(
+                asyncio.to_thread(
+                    delegate_tool.execute,
+                    role=role,
+                    objective=objective,
+                    target_file=fsm.target_file,
+                )
+            )
+            task.add_done_callback(lambda _: wake_event.set())
+
+            # ── 事件泵：中继 Worker 进度 ──
+            try:
+                while not task.done():
+                    try:
+                        await asyncio.wait_for(wake_event.wait(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        pass
+                    wake_event.clear()
+
+                    while True:
+                        try:
+                            pct, msg, _meta = progress_queue.get_nowait()
+                            yield StreamEvent(
+                                "tool_progress",
+                                msg or f"进度 {pct}%",
+                                metadata={"percent": pct, "tool": "delegate_task"},
+                            )
+                        except _thread_queue.Empty:
+                            break
+            finally:
+                delegate_tool._progress_callback = None
+
+            # ── 获取 Worker 报告 ──
+            try:
+                raw_report = task.result()
+                import json as _json
+                try:
+                    report_dict = _json.loads(raw_report)
+                except (ValueError, TypeError):
+                    report_dict = {
+                        "status": "UNKNOWN",
+                        "summary": str(raw_report)[:200],
+                    }
+            except Exception as e:
+                report_dict = {
+                    "status": "FAIL",
+                    "summary": f"Worker 崩溃: {e}",
+                }
+
+            fsm.feed_report(report_dict)
+
+            status = report_dict.get("status", "UNKNOWN")
+            summary_text = report_dict.get("summary", "无摘要")
+            emoji = "✅" if status == "PASS" else "❌" if status == "FAIL" else "⚠️"
+            yield StreamEvent(
+                "text",
+                f"{emoji} [{role}] {status}: {summary_text}\n\n",
+            )
+
+        # ── FSM 完成：让 LLM 生成用户友好的汇报 ──
+        fsm_summary = fsm.build_summary()
+        yield StreamEvent("text", f"\n{fsm_summary}\n\n")
+
+        # 将 FSM 摘要注入历史，让 Coordinator LLM 生成最终回答
+        self.history.append(Message(
+            role=Role.TOOL,
+            content=fsm_summary,
+            tool_call_id="fsm_pipeline",
+            name="fsm_pipeline",
+        ))
+
+        # 一次 LLM 调用生成自然语言汇报
+        try:
+            self.history.append(Message(
+                role=Role.USER,
+                content=(
+                    "上方是 FSM 状态机自动执行的结果摘要。"
+                    "请根据这些报告，用简洁的中文向用户汇报：做了什么、结果如何、是否有问题需要关注。"
+                ),
+            ))
+            response = self.llm.chat(self.history)
+            self.history.append(response)
+            if response.content:
+                yield StreamEvent("text", response.content)
+        except Exception as e:
+            yield StreamEvent("text", f"（汇报生成失败: {e}）")
+
+        self.state = AgentState.FINISHED
+        yield StreamEvent("finish", "FSM 流水线执行完毕。")
+        self._save_session(user_input, fsm_summary)
+
     async def run_async(self, user_input: str) -> AsyncGenerator[StreamEvent, None]:
         """
         异步流式状态机 —— Agent 的心脏。
@@ -865,10 +1082,45 @@ class Agent:
         self.history.append(Message(role=Role.USER, content=augmented_input))
         self.state = AgentState.THINKING
 
+        # ══════════════════════════════════════════
+        # Coordinator 路由分支：意图分类 → FSM 硬接管
+        # 非 Coordinator（Worker / 单 Agent）直接走 ReAct
+        # ══════════════════════════════════════════
+        is_coordinator = self.tools.get("delegate_task") is not None
+        if is_coordinator:
+            try:
+                from core.router import classify_intent, TaskIntent, TaskFSM
+
+                yield StreamEvent("text", "🚦 正在分析任务意图...\n")
+                intent, router_file, reason = classify_intent(
+                    self.llm, user_input,
+                    history_context=self._session_file or "",
+                )
+                yield StreamEvent("text", f"📋 意图: **{intent.value}** — {reason}\n\n")
+
+                # 如果 Router 提取到文件路径，记录到 session
+                if router_file:
+                    self._session_file = router_file
+
+                if intent != TaskIntent.TASK_SIMPLE and self._session_file:
+                    fsm = TaskFSM(intent, user_input, self._session_file)
+                    async for event in self._run_fsm_pipeline(fsm, user_input):
+                        yield event
+                    return
+                elif intent != TaskIntent.TASK_SIMPLE and not self._session_file:
+                    # 需要文件但没有文件 → 降级为 ReAct 让 LLM 询问用户
+                    yield StreamEvent(
+                        "text",
+                        "⚠️ 未检测到文件路径，降级为自由对话模式。\n\n",
+                    )
+            except Exception as e:
+                logger.warning("[Router] 路由异常，降级为 ReAct: %s", e)
+                yield StreamEvent("text", f"⚠️ 路由异常，降级为自由模式: {e}\n\n")
+
         openai_tools = self.tools.to_openai_tools()
 
         # ══════════════════════════════════════════
-        # ReAct 主循环
+        # ReAct 主循环（SIMPLE 任务 / Worker / 降级场景）
         # ══════════════════════════════════════════
         for step in range(1, self.max_steps + 1):
             # Token 水位线压缩防爆

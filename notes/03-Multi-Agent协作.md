@@ -283,6 +283,92 @@ DocMaster Agent 的核心链路 `Plan → Execute → Review` 是一个经典的
 
 **演进方向**：从纯 ReAct 走向"路由 + 状态机"混合驱动——凡是路径确定的流水线，应从大模型的自由意志中剥离出来，用代码级 if-else 或状态机进行硬性拦截和锁死。
 
+### 三层路由改造方案（Intent Classifier + FSM）
+
+核心思想：**主 Agent 不是自由发挥写工作流的创作者，而是一个极其轻量级的意图分类器（Intent Classifier）。一旦分类完成，Python 硬编码的状态机接管全部流转。**
+
+#### 第一层：约束解码（Constrained Decoding / Structured Output）
+
+主 Agent 接收用户输入后，通过 Function Calling 的结构化输出强制只返回枚举值：
+
+```python
+class TaskIntent(Enum):
+    TASK_FULL         = "full"          # 全量：Plan → Execute → Review
+    TASK_REVIEW_ONLY  = "review_only"   # 仅审查
+    TASK_FORMAT_ONLY  = "format_only"   # 仅排版（跳过 Plan）
+    TASK_EXECUTE_ONLY = "execute_only"  # 仅执行（跳过 Plan + Review）
+    TASK_SIMPLE       = "simple"        # 简单任务：Coordinator 直接调工具，不 Fork
+```
+
+LLM 不输出冗长计划，只做**单选题**。将发散的生成任务降维成确定性的分类任务，极大降低幻觉。
+
+#### 第二层：Python 状态机硬接管（防遗漏的核心）
+
+一旦 LLM 吐出枚举值，大模型的路由任务就**结束了**。后续状态流转完全由 Python FSM 强行接管：
+
+```python
+# 每种 Intent 对应一条硬编码的 Worker 调度链
+_INTENT_PIPELINES = {
+    TaskIntent.TASK_FULL: [
+        ("Planner",  "分析文档现状并制定执行计划"),
+        ("Executor", "按 Planner 计划执行排版操作"),
+        ("Reviewer", "审查执行结果，L1 铁律一票否决"),
+    ],
+    TaskIntent.TASK_REVIEW_ONLY: [
+        ("Reviewer", "全面审查文档格式与内容"),
+    ],
+    TaskIntent.TASK_FORMAT_ONLY: [
+        ("Executor", "执行排版操作"),
+        ("Reviewer", "审查排版结果"),
+    ],
+    TaskIntent.TASK_EXECUTE_ONLY: [
+        ("Executor", "执行指定操作"),
+    ],
+}
+```
+
+大模型只负责**选轨道**，而**轨道上有几个检查站**是由传统硬编码决定的，绝对不可能遗漏。
+
+#### 第三层：悲观降级（Pessimistic Fallback 兜底）
+
+如果 LLM 的意图分类器犯傻（返回非法值、超时、JSON 解析失败），系统默认拨向最安全的 `TASK_FULL`，宁可多花 Token 跑完整 Plan→Execute→Review，也绝不漏掉用户的潜在需求。
+
+#### 实现位置
+
+| 文件 | 职责 |
+|------|------|
+| `core/router.py`（新建） | `TaskIntent` 枚举 + `classify_intent()` 意图分类 + `TaskFSM` 状态机 |
+| `core/agent.py` | `run()` 主循环接入 Router：先分类 → FSM 驱动 `delegate_task` 调度链 |
+| `tools/delegate.py` | 保留，但不再由 Coordinator LLM 自由调用，改为 FSM 程序化调用 |
+
+#### 架构图
+
+```
+用户输入
+  ↓
+Coordinator LLM（约束解码，只输出枚举）
+  ↓
+┌─────────────────────────────────────────────────┐
+│  Python FSM 硬接管（代码级 if-else，不可跳过）     │
+│                                                   │
+│  TASK_FULL:                                       │
+│    Planner ──→ Executor ──→ Reviewer（强制三步）   │
+│                                                   │
+│  TASK_REVIEW_ONLY:                                │
+│    Reviewer（只走这一步）                          │
+│                                                   │
+│  TASK_FORMAT_ONLY:                                │
+│    Executor ──→ Reviewer（强制两步）               │
+│                                                   │
+│  TASK_SIMPLE:                                     │
+│    Coordinator 直接调工具，不 Fork Worker           │
+└─────────────────────────────────────────────────┘
+  ↓
+向用户汇报
+```
+
+> 面试话术：*"我没有把命脉交给大模型的'自主决策'。我把主 Agent 降维成了一个极其轻量级的意图分类器，只做单选题——TASK_FULL、TASK_REVIEW_ONLY 还是 TASK_FORMAT_ONLY。一旦分类完成，接下来的状态流转完全由 Python 状态机硬接管。大模型只是一个聪明的'道岔开关'，而下面跑的火车和铁轨，全是用死板的工程代码焊死的。"*
+
 ## 【深水区】面试高频连环追问
 
 ### 具体回答
